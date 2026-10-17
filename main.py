@@ -46,8 +46,14 @@ class WordRequest(BaseModel):
     context_vi: str = ""
 
 def extract_youtube_id(url: str):
-    m = re.search(r"(?:v=|youtu\.be\/|embed\/|shorts\/)([0-9A-Za-z_-]{11})", url)
-    return m.group(1) if m else None
+    if not url: return None
+    u = url.strip()
+    # Hỗ trợ đầy đủ: watch?v=, youtu.be/, live/, shorts/, embed/, v/
+    m = re.search(r"(?:v=|youtu\.be\/|embed\/|shorts\/|live\/|\/v\/)([0-9A-Za-z_-]{11})", u)
+    if m: return m.group(1)
+    # Nếu người dùng dán trực tiếp chuỗi có chứa ID 11 ký tự
+    m2 = re.search(r"(?:^|[^0-9A-Za-z_-])([0-9A-Za-z_-]{11})(?:$|[^0-9A-Za-z_-])", u)
+    return m2.group(1) if m2 else None
 
 def safe_req(method: str, url: str, **kw):
     kw.setdefault("timeout", 12)
@@ -375,13 +381,16 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     <div class="bg-slate-900 border border-slate-800 p-2.5 rounded-xl mb-3 space-y-2">
       <div class="flex gap-2">
-        <input id="videoUrl" type="text" placeholder="Dán link YouTube có phụ đề (CC) vào đây..." class="flex-1 p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-white text-xs sm:text-sm min-w-0">
+        <div class="relative flex-1 min-w-0">
+          <input id="videoUrl" type="text" placeholder="Dán mọi link YouTube (watch, live, youtu.be)..." class="w-full p-2.5 pr-8 rounded-lg bg-slate-950 border border-slate-700 text-white text-xs sm:text-sm">
+          <button onclick="document.getElementById('videoUrl').value='';document.getElementById('videoUrl').focus();" class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-xs px-1">✕</button>
+        </div>
         <button onclick="analyzeVideo()" id="btnLoad" class="bg-blue-600 hover:bg-blue-500 active:bg-blue-700 px-4 py-2.5 rounded-lg font-semibold text-xs sm:text-sm shrink-0">⚡ Dịch Video</button>
       </div>
       <div class="flex items-center gap-1.5 overflow-x-auto pb-0.5 text-[11px]">
         <span class="text-slate-400 shrink-0">🎯 Video mẫu:</span>
         <button onclick="quickLoad('gedoSfZvBgE')" class="bg-slate-800 hover:bg-slate-700 text-blue-300 px-2.5 py-1 rounded-md shrink-0">1. Polyp Đại Tràng</button>
-        <button onclick="quickLoad('f4c829V_N6I')" class="bg-slate-800 hover:bg-slate-700 text-emerald-300 px-2.5 py-1 rounded-md shrink-0">2. Hội Nghị Thực Quản WEO</button>
+        <button onclick="quickLoad('D_9Qzo_H7kk')" class="bg-slate-800 hover:bg-slate-700 text-emerald-300 px-2.5 py-1 rounded-md shrink-0">2. Hội Nghị Live (D_9Qzo_H7kk)</button>
       </div>
     </div>
 
@@ -450,8 +459,12 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     cabinAudio.playsInline = true; dictAudio.playsInline = true;
 
     function extractVid(url) {
-      const m = url.match(/(?:v=|youtu\.be\/|embed\/|shorts\/)([0-9A-Za-z_-]{11})/);
-      return m ? m[1] : null;
+      if (!url) return null;
+      const u = url.trim();
+      const m = u.match(/(?:v=|youtu\.be\/|embed\/|shorts\/|live\/|\/v\/)([0-9A-Za-z_-]{11})/);
+      if (m) return m[1];
+      const m2 = u.match(/(?:^|[^0-9A-Za-z_-])([0-9A-Za-z_-]{11})(?:$|[^0-9A-Za-z_-])/);
+      return m2 ? m2[1] : null;
     }
 
     function quickLoad(vid) {
@@ -526,7 +539,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       box.innerHTML = '<p class="text-blue-400 text-xs sm:text-sm text-center pt-16 animate-pulse">⏳ Đang trích xuất phụ đề & dịch song ngữ (3-8 giây)...</p>';
       document.getElementById("subCount").innerText = "Đang tải...";
 
-      const r = await fetch("/api/process-video", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({url})});
+      const r = await fetch("/api/process-video", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({url: "https://www.youtube.com/watch?v=" + vid})});
       let d = await r.json();
 
       if (d.need_client_fetch) {
