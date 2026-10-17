@@ -48,10 +48,8 @@ class WordRequest(BaseModel):
 def extract_youtube_id(url: str):
     if not url: return None
     u = url.strip()
-    # Hỗ trợ đầy đủ: watch?v=, youtu.be/, live/, shorts/, embed/, v/
     m = re.search(r"(?:v=|youtu\.be\/|embed\/|shorts\/|live\/|\/v\/)([0-9A-Za-z_-]{11})", u)
     if m: return m.group(1)
-    # Nếu người dùng dán trực tiếp chuỗi có chứa ID 11 ký tự
     m2 = re.search(r"(?:^|[^0-9A-Za-z_-])([0-9A-Za-z_-]{11})(?:$|[^0-9A-Za-z_-])", u)
     return m2.group(1) if m2 else None
 
@@ -109,22 +107,51 @@ def parse_captions(content: str) -> list[dict]:
     return res
 
 def extract_cap_url(html_str: str):
-    if not html_str or '"captionTracks":' not in html_str: return None
-    m = re.search(r'"captionTracks":\s*(\[.*?\])', html_str)
-    if m:
-        try:
-            tracks = json.loads(m.group(1))
-            if tracks:
-                tr = next((x for x in tracks if x.get("languageCode", "").startswith("en")), tracks[0])
-                return tr.get("baseUrl")
-        except Exception: pass
-    return None
+    """Bóc tách chính xác mảng captionTracks bất chấp cấu trúc mảng lồng nhau runs:[...]"""
+    if not html_str or '"captionTracks":' not in html_str:
+        return None
+    idx = html_str.find('"captionTracks":')
+    start_bracket = html_str.find('[', idx)
+    if start_bracket != -1:
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start_bracket, min(start_bracket + 35000, len(html_str))):
+            ch = html_str[i]
+            if esc:
+                esc = False
+                continue
+            if ch == '\\':
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if not in_str:
+                if ch == '[': depth += 1
+                elif ch == ']':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            tracks = json.loads(html_str[start_bracket:i+1])
+                            if tracks:
+                                tr = next((x for x in tracks if x.get("languageCode", "").startswith("en")), tracks[0])
+                                return tr.get("baseUrl")
+                        except Exception:
+                            break
+    # Dự phòng bằng Regex quét trực tiếp baseUrl của timedtext
+    urls = re.findall(r'"baseUrl"\s*:\s*"(https://www\.youtube\.com/api/timedtext[^"]+)"', html_str)
+    for u in urls:
+        clean_u = u.replace("\\u0026", "&").replace("\\/", "/")
+        if "lang=en" in clean_u:
+            return clean_u
+    return urls[0].replace("\\u0026", "&").replace("\\/", "/") if urls else None
 
 def w_tactiq(vid: str):
     for lc in ["en", "en-US", "en-GB"]:
         r = safe_req("POST", "https://tactiq-apps-prod.tactiq.io/transcript",
                      json={"videoUrl": f"https://www.youtube.com/watch?v={vid}", "langCode": lc},
-                     headers={"Origin": "https://tactiq.io", "Referer": "https://tactiq.io/", "Content-Type": "application/json"}, timeout=12)
+                     headers={"Origin": "https://tactiq.io", "Referer": "https://tactiq.io/", "Content-Type": "application/json"}, timeout=14)
         if r.status_code == 200 and r.json().get("captions"):
             subs = [{"text": clean_txt(c.get("text", "")), "start": round(to_sec(c.get("start", 0)), 2), "duration": round(to_sec(c.get("dur", 2.5)), 2)} for c in r.json()["captions"] if clean_txt(c.get("text", ""))]
             if subs: return subs
@@ -132,7 +159,7 @@ def w_tactiq(vid: str):
 
 def w_notegpt(vid: str):
     r = safe_req("GET", f"https://notegpt.io/api/v2/video-transcript?platform=youtube&video_id={vid}",
-                 headers={"Referer": "https://notegpt.io/youtube-transcript-generator"}, timeout=12)
+                 headers={"Referer": "https://notegpt.io/youtube-transcript-generator"}, timeout=14)
     if r.status_code == 200:
         tr_dict = r.json().get("data", {}).get("transcripts", {})
         for k in tr_dict:
@@ -148,35 +175,38 @@ def w_notegpt(vid: str):
                 if subs: return subs
     return []
 
-def w_yttrans(vid: str):
-    r = safe_req("GET", f"https://youtubetranscript.com/?server_vid2={vid}", timeout=12)
-    if r.status_code == 200 and "<text" in r.text:
-        return parse_captions(r.text)
-    return []
-
 def w_innertube(vid: str):
+    """Sử dụng ANDROID 20.10.38 và IOS 20.10.4 để lấy link phụ đề không bị dính cờ exp=xpe"""
     clients = [
-        {"client": {"clientName": "ANDROID_VR", "clientVersion": "1.61.48", "androidSdkVersion": 34, "userAgent": "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 14; en_US; Quest 3; Build/UP1A.231005.007.A1) gzip", "hl": "en", "gl": "US"}},
-        {"client": {"clientName": "IOS", "clientVersion": "20.03.02", "deviceMake": "Apple", "deviceModel": "iPhone16,2", "userAgent": "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)", "hl": "en", "gl": "US"}},
-        {"client": {"clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER", "clientVersion": "2.0", "hl": "en", "gl": "US"}, "thirdParty": {"embedUrl": "https://www.youtube.com/"}}
+        {"client": {"clientName": "ANDROID", "clientVersion": "20.10.38", "androidSdkVersion": 30, "userAgent": "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip", "hl": "en", "gl": "US"}},
+        {"client": {"clientName": "IOS", "clientVersion": "20.10.4", "deviceMake": "Apple", "deviceModel": "iPhone16,2", "userAgent": "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)", "hl": "en", "gl": "US"}},
+        {"client": {"clientName": "ANDROID_VR", "clientVersion": "1.61.48", "androidSdkVersion": 34, "userAgent": "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 14; en_US; Quest 3; Build/UP1A.231005.007.A1) gzip", "hl": "en", "gl": "US"}}
     ]
-    for ctx in clients:
-        try:
-            ua = ctx["client"].get("userAgent", UA)
-            r = safe_req("POST", "https://www.youtube.com/youtubei/v1/player?prettyPrint=false", json={"videoId": vid, "context": ctx}, headers={"User-Agent": ua}, timeout=8)
-            if r.status_code == 200:
-                tracks = r.json().get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
-                if tracks:
-                    tr = next((x for x in tracks if x.get("languageCode", "").startswith("en")), tracks[0])
-                    cu = tr.get("baseUrl")
-                    if cu:
-                        subs = parse_captions(safe_req("GET", cu + "&fmt=json3", headers={"User-Agent": ua}, timeout=8).text) or parse_captions(safe_req("GET", cu, headers={"User-Agent": ua}, timeout=8).text)
-                        if subs: return subs
-        except Exception: pass
+    endpoints = [
+        "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+        "https://corsproxy.io/?https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+    ]
+    for ep in endpoints:
+        for ctx in clients:
+            try:
+                ua = ctx["client"].get("userAgent", UA)
+                r = safe_req("POST", ep, json={"videoId": vid, "context": ctx}, headers={"User-Agent": ua, "Origin": "https://www.youtube.com"}, timeout=10)
+                if r.status_code == 200:
+                    tracks = r.json().get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
+                    if tracks:
+                        tr = next((x for x in tracks if x.get("languageCode", "").startswith("en")), tracks[0])
+                        cu = tr.get("baseUrl", "")
+                        if cu and "exp=xpe" not in cu:
+                            for fmt in ["&fmt=json3", ""]:
+                                r_sub = safe_req("GET", cu + fmt, headers={"User-Agent": ua}, timeout=10)
+                                subs = parse_captions(r_sub.text)
+                                if subs: return subs
+            except Exception:
+                pass
     return []
 
 def w_piped_inv(vid: str):
-    for host in ["https://pipedapi.kavin.rocks", "https://api.piped.private.coffee", "https://pipedapi.leptons.xyz"]:
+    for host in ["https://pipedapi.kavin.rocks", "https://api.piped.private.coffee", "https://pipedapi.leptons.xyz", "https://pipedapi.nosebs.ru"]:
         try:
             r = safe_req("GET", f"{host}/streams/{vid}", timeout=8)
             if r.status_code == 200 and r.json().get("subtitles"):
@@ -186,7 +216,7 @@ def w_piped_inv(vid: str):
                     subs = parse_captions(safe_req("GET", ch["url"], timeout=8).text)
                     if subs: return subs
         except Exception: pass
-    for inv in ["https://inv.nadeko.net", "https://invidious.nerdvpn.de", "https://yewtu.be"]:
+    for inv in ["https://inv.nadeko.net", "https://invidious.nerdvpn.de", "https://yewtu.be", "https://invidious.jing.rocks"]:
         try:
             r = safe_req("GET", f"{inv}/api/v1/captions/{vid}", timeout=8)
             if r.status_code == 200 and r.json().get("captions"):
@@ -200,14 +230,17 @@ def w_piped_inv(vid: str):
 
 def w_proxy(vid: str, proxy_tpl: str):
     w_url = f"https://www.youtube.com/watch?v={vid}&hl=en"
-    r1 = safe_req("GET", proxy_tpl.format(urllib.parse.quote(w_url, safe='')), timeout=10)
+    r1 = safe_req("GET", proxy_tpl.format(urllib.parse.quote(w_url, safe='')), timeout=12)
     if r1.status_code == 200 and '"captionTracks":' in r1.text:
         cu = extract_cap_url(r1.text)
         if cu:
-            subs = parse_captions(safe_req("GET", proxy_tpl.format(urllib.parse.quote(cu + "&fmt=json3", safe='')), timeout=10).text)
-            if not subs:
-                subs = parse_captions(safe_req("GET", proxy_tpl.format(urllib.parse.quote(cu, safe='')), timeout=10).text)
-            return subs
+            for target in [cu + "&fmt=json3", cu]:
+                r2 = safe_req("GET", proxy_tpl.format(urllib.parse.quote(target, safe='')), timeout=12)
+                subs = parse_captions(r2.text)
+                if subs: return subs
+                r3 = safe_req("GET", target, timeout=10)
+                subs = parse_captions(r3.text)
+                if subs: return subs
     return []
 
 def w_ytapi(vid: str):
@@ -219,19 +252,19 @@ def w_ytapi(vid: str):
 
 def fetch_youtube_subtitles(video_id: str) -> list[dict]:
     tasks = [
+        lambda: w_innertube(video_id),
         lambda: w_tactiq(video_id),
         lambda: w_notegpt(video_id),
-        lambda: w_yttrans(video_id),
-        lambda: w_innertube(video_id),
+        lambda: w_ytapi(video_id),
         lambda: w_piped_inv(video_id),
         lambda: w_proxy(video_id, "https://api.codetabs.com/v1/proxy?quest={}"),
-        lambda: w_proxy(video_id, "https://api.allorigins.win/raw?url={}"),
-        lambda: w_ytapi(video_id)
+        lambda: w_proxy(video_id, "https://corsproxy.io/?{}"),
+        lambda: w_proxy(video_id, "https://api.allorigins.win/raw?url={}")
     ]
     ex = ThreadPoolExecutor(max_workers=8)
     try:
         futures = [ex.submit(fn) for fn in tasks]
-        for fut in as_completed(futures, timeout=15):
+        for fut in as_completed(futures, timeout=18):
             try:
                 res = fut.result()
                 if res and len(res) > 0:
@@ -286,9 +319,9 @@ def translate_batch_list(texts: list[str], batch_size: int = 35) -> list[str]:
     return out
 
 def prepare_initial_subs(vid: str, raw_subs: list[dict]):
-    subs = raw_subs[:3000]
+    subs = raw_subs[:3500]
     for s in subs: s["text"] = clean_txt(s.get("text", "")) or "..."
-    init_n = min(80, len(subs))
+    init_n = min(70, len(subs))
     init_vi = translate_batch_list([subs[i]["text"] for i in range(init_n)])
     for i, s in enumerate(subs):
         s["vi"] = init_vi[i] if i < init_n else "⏳ Đang dịch tự động..."
@@ -390,7 +423,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       <div class="flex items-center gap-1.5 overflow-x-auto pb-0.5 text-[11px]">
         <span class="text-slate-400 shrink-0">🎯 Video mẫu:</span>
         <button onclick="quickLoad('gedoSfZvBgE')" class="bg-slate-800 hover:bg-slate-700 text-blue-300 px-2.5 py-1 rounded-md shrink-0">1. Polyp Đại Tràng</button>
-        <button onclick="quickLoad('D_9Qzo_H7kk')" class="bg-slate-800 hover:bg-slate-700 text-emerald-300 px-2.5 py-1 rounded-md shrink-0">2. Hội Nghị Live (D_9Qzo_H7kk)</button>
+        <button onclick="quickLoad('D_9Qzo_H7kk')" class="bg-slate-800 hover:bg-slate-700 text-emerald-300 px-2.5 py-1 rounded-md shrink-0">2. Hội Nghị Live WEO (D_9Qzo_H7kk)</button>
       </div>
     </div>
 
@@ -501,29 +534,108 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       return res;
     }
 
+    function extractCapUrlFromHtml(html) {
+      if (!html || !html.includes('"captionTracks":')) return null;
+      const idx = html.indexOf('"captionTracks":');
+      const start = html.indexOf('[', idx);
+      if (start !== -1) {
+        let depth = 0, inStr = false, esc = false;
+        for (let i = start; i < Math.min(start + 35000, html.length); i++) {
+          const ch = html[i];
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') { inStr = !inStr; continue; }
+          if (!inStr) {
+            if (ch === '[') depth++;
+            else if (ch === ']') {
+              depth--;
+              if (depth === 0) {
+                try {
+                  const tracks = JSON.parse(html.substring(start, i + 1));
+                  const tr = tracks.find(x => (x.languageCode || "").startsWith("en")) || tracks[0];
+                  if (tr && tr.baseUrl) return tr.baseUrl;
+                } catch(e) {}
+                break;
+              }
+            }
+          }
+        }
+      }
+      const m = html.match(/"baseUrl"\s*:\s*"(https:\/\/www\.youtube\.com\/api\/timedtext[^"]+)"/);
+      return m ? m[1].replace(/\\u0026/g, "&").replace(/\\\//g, "/") : null;
+    }
+
     async function fetchFromPhoneBrowser(vid) {
+      // 1. Gọi trực tiếp Tactiq từ trình duyệt (IP điện thoại/PC của người dùng không bị chặn)
+      try {
+        const rT = await fetch("https://tactiq-apps-prod.tactiq.io/transcript", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({videoUrl: "https://www.youtube.com/watch?v=" + vid, langCode: "en"})
+        });
+        if (rT.ok) {
+          const dT = await rT.json();
+          if (dT.captions && dT.captions.length) {
+            return dT.captions.map(c => ({
+              text: (c.text || "").replace(/\n/g, " ").trim(),
+              start: +(parseFloat(c.start || 0)).toFixed(2),
+              duration: +(parseFloat(c.dur || 2.5)).toFixed(2)
+            })).filter(x => x.text);
+          }
+        }
+      } catch(e) {}
+
+      // 2. Gọi InnerTube ANDROID 20.10.38 qua CORS Proxy để lấy baseUrl sạch (không dính exp=xpe)
+      const postProxies = [
+        "https://corsproxy.io/?https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+      ];
+      for (const ep of postProxies) {
+        try {
+          const rIn = await fetch(ep, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+              videoId: vid,
+              context: {client: {clientName: "ANDROID", clientVersion: "20.10.38", androidSdkVersion: 30, hl: "en", gl: "US"}}
+            })
+          });
+          if (rIn.ok) {
+            const dIn = await rIn.json();
+            const tracks = (((dIn.captions || {}).playerCaptionsTracklistRenderer || {}).captionTracks) || [];
+            const tr = tracks.find(x => (x.languageCode || "").startsWith("en")) || tracks[0];
+            if (tr && tr.baseUrl) {
+              for (const px of [u => "https://corsproxy.io/?" + encodeURIComponent(u), u => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u)]) {
+                try {
+                  const rSub = await fetch(px(tr.baseUrl + "&fmt=json3"));
+                  const subs = parseCapData(await rSub.text());
+                  if (subs.length) return subs;
+                } catch(e) {}
+              }
+            }
+          }
+        } catch(e) {}
+      }
+
+      // 3. Quét trang Watch qua Proxy với bộ đếm ngoặc chuẩn xác
       const wUrl = "https://www.youtube.com/watch?v=" + vid + "&hl=en";
       const proxies = [
         u => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u),
+        u => "https://corsproxy.io/?" + encodeURIComponent(u),
         u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u)
       ];
       for (const px of proxies) {
         try {
           const r1 = await fetch(px(wUrl));
           const html = await r1.text();
-          const m = html.match(/"captionTracks":\s*(\[.*?\])/);
-          if (m) {
-            const tracks = JSON.parse(m[1]);
-            const tr = tracks.find(x => (x.languageCode || "").startsWith("en")) || tracks[0];
-            if (tr && tr.baseUrl) {
-              const r2 = await fetch(px(tr.baseUrl + "&fmt=json3"));
-              let subs = parseCapData(await r2.text());
-              if (!subs.length) {
-                const r3 = await fetch(px(tr.baseUrl));
-                subs = parseCapData(await r3.text());
-              }
-              if (subs.length) return subs;
+          const baseUrl = extractCapUrlFromHtml(html);
+          if (baseUrl) {
+            const r2 = await fetch(px(baseUrl + "&fmt=json3"));
+            let subs = parseCapData(await r2.text());
+            if (!subs.length) {
+              const r3 = await fetch(px(baseUrl));
+              subs = parseCapData(await r3.text());
             }
+            if (subs.length) return subs;
           }
         } catch(e){}
       }
@@ -536,7 +648,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
       initPlayer(vid);
       const box = document.getElementById("subtitleList");
-      box.innerHTML = '<p class="text-blue-400 text-xs sm:text-sm text-center pt-16 animate-pulse">⏳ Đang trích xuất phụ đề & dịch song ngữ (3-8 giây)...</p>';
+      box.innerHTML = '<p class="text-blue-400 text-xs sm:text-sm text-center pt-16 animate-pulse">⏳ Đang trích xuất phụ đề & dịch song ngữ (3-10 giây)...</p>';
       document.getElementById("subCount").innerText = "Đang tải...";
 
       const r = await fetch("/api/process-video", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({url: "https://www.youtube.com/watch?v=" + vid})});
