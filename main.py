@@ -1,1338 +1,615 @@
-import re
-import json
-import time
-import html
-import urllib3
-import requests
+import re, json, time, html, urllib.parse, urllib3, requests
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
-from youtube_transcript_api import YouTubeTranscriptApi
 
-# Tắt cảnh báo SSL khi fallback trên một số môi trường mạng
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-}
-
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 session = requests.Session()
-session.headers.update(HEADERS)
+session.headers.update({"User-Agent": UA})
 
-# Bản đồ sửa lỗi phụ đề tự động YouTube nghe nhầm thuật ngữ Y khoa
-SPEECH_TO_TEXT_FIX = {
-    "secum": "cecum",
-    "seekum": "cecum",
-    "seecum": "cecum",
-    "caecum": "cecum",
-    "oesophagus": "esophagus",
-    "oesophageal": "esophageal",
-    "conex": "conecct",
-}
+SPEECH_FIX = {"secum": "cecum", "seekum": "cecum", "caecum": "cecum", "oesophagus": "esophagus", "oesophageal": "esophageal", "conex": "conecct"}
 
-# Từ điển Y khoa chuyên ngành Nội soi Tiêu hóa (Thực quản - Dạ dày - Đại trực tràng)
 MEDICAL_DICT = {
-    "small": "Nhỏ", "pale": "Nhợt nhạt / Sáng màu", "round": "Tròn",
-    "pit": "Hố tuyến (Pit)", "pits": "Các hố tuyến (Pits)",
-    "polyp": "Polyp", "polyps": "Các khối polyp",
-    "colon": "Đại tràng", "rectum": "Trực tràng", "sigmoid": "Đại tràng sigma",
-    "cecum": "Manh tràng (Phần đầu đại tràng)", "secum": "Manh tràng (Cecum)",
-    "ileum": "Hồi tràng", "duodenum": "Tá tràng", "gastric": "Thuộc dạ dày", "stomach": "Dạ dày",
-    "esophagus": "Thực quản", "esophageal": "Thuộc thực quản",
-    "squamous": "Tế bào vảy / Biểu mô vảy", "cell": "Tế bào", "cells": "Các tế bào",
-    "cancer": "Ung thư", "carcinoma": "Ung thư biểu mô",
-    "adenocarcinoma": "Ung thư biểu mô tuyến", "escc": "Ung thư biểu mô tế bào vảy thực quản (ESCC)",
-    "mucosal": "Thuộc niêm mạc", "mucosa": "Niêm mạc",
-    "submucosal": "Dưới niêm mạc", "submucosa": "Lớp dưới niêm mạc",
-    "epithelium": "Biểu mô", "epithelial": "Thuộc biểu mô",
-    "lamina propria": "Lớp đệm niêm mạc", "muscularis": "Lớp cơ",
-    "gland": "Tuyến", "glands": "Các tuyến",
-    "hyperplastic": "Tăng sản", "malignant": "Ác tính", "benign": "Lành tính",
-    "dysplasia": "Loạn sản", "neoplasia": "Tân sinh / U tân sinh", "neoplasm": "Khối tân sinh",
-    "invasion": "Xâm lấn", "invasive": "Có tính xâm lấn", "superficial": "Nông / Bề mặt",
-    "metastasis": "Di căn", "lymph": "Bạch huyết", "lymphovascular": "Mạch bạch huyết",
-    "risk": "Nguy cơ", "minimal": "Tối thiểu",
-    "leave it": "Giữ lại (Không can thiệp)", "take it": "Cắt bỏ / Lấy ra",
-    "endoscopy": "Nội soi", "endoscopic": "Qua nội soi", "endoscopist": "Bác sĩ nội soi",
-    "lesion": "Tổn thương", "lesions": "Các tổn thương",
-    "biopsy": "Sinh thiết", "adenoma": "U tuyến", "adenomas": "Các u tuyến",
-    "colorectal": "Đại trực tràng", "surgery": "Phẫu thuật", "table": "Bảng phân loại / Sơ đồ",
-    "close view": "Góc nhìn cận cảnh", "chromoendoscopy": "Nội soi nhuộm màu",
-    "nbi": "Nội soi dải tần ánh sáng hẹp (NBI)", "wli": "Nội soi ánh sáng trắng (WLI)",
-    "lugol": "Dung dịch Lugol (Nhuộm i-ốt phát hiện tổn thương thực quản)",
-    "ipcl": "Quai mao mạch nhú trong biểu mô (IPCL)",
-    "barrett": "Thực quản Barrett", "stricture": "Hẹp ống tiêu hóa",
-    "ulcer": "Vết loét", "erosion": "Trợt niêm mạc", "nodule": "Nốt / Cục nhỏ",
-    "vessel": "Mạch máu", "vessels": "Các mạch máu", "vascular": "Mạch máu",
-    "resection": "Cắt bỏ", "emr": "Cắt hớt niêm mạc qua nội soi (EMR)",
-    "esd": "Cắt tách dưới niêm mạc qua nội soi (ESD)",
-    "screening": "Tầm soát / Sàng lọc", "detection": "Phát hiện",
-    "epidemiology": "Dịch tễ học", "diagnosis": "Chẩn đoán", "prognosis": "Tiên lượng",
-    "margin": "Bờ diện cắt / Ranh giới", "demarcation": "Đường ranh giới (Demarcation line)"
+    "small": "Nhỏ", "pale": "Nhợt nhạt / Sáng màu", "round": "Tròn", "pit": "Hố tuyến", "pits": "Các hố tuyến",
+    "polyp": "Polyp", "polyps": "Các khối polyp", "colon": "Đại tràng", "rectum": "Trực tràng", "sigmoid": "Đại tràng sigma",
+    "cecum": "Manh tràng", "secum": "Manh tràng (Cecum)", "ileum": "Hồi tràng", "duodenum": "Tá tràng", "stomach": "Dạ dày",
+    "esophagus": "Thực quản", "esophageal": "Thuộc thực quản", "squamous": "Tế bào vảy", "cancer": "Ung thư",
+    "carcinoma": "Ung thư biểu mô", "escc": "Ung thư biểu mô tế bào vảy thực quản (ESCC)", "mucosal": "Thuộc niêm mạc",
+    "mucosa": "Niêm mạc", "submucosal": "Dưới niêm mạc", "submucosa": "Lớp dưới niêm mạc", "epithelium": "Biểu mô",
+    "gland": "Tuyến", "glands": "Các tuyến", "hyperplastic": "Tăng sản", "malignant": "Ác tính", "benign": "Lành tính",
+    "dysplasia": "Loạn sản", "neoplasia": "Tân sinh", "invasion": "Xâm lấn", "risk": "Nguy cơ", "minimal": "Tối thiểu",
+    "leave it": "Giữ lại", "take it": "Cắt bỏ", "endoscopy": "Nội soi", "lesion": "Tổn thương", "lesions": "Các tổn thương",
+    "biopsy": "Sinh thiết", "adenoma": "U tuyến", "colorectal": "Đại trực tràng", "surgery": "Phẫu thuật",
+    "chromoendoscopy": "Nội soi nhuộm màu", "nbi": "Nội soi dải tần ánh sáng hẹp (NBI)", "lugol": "Nhuộm Lugol",
+    "vessel": "Mạch máu", "vessels": "Các mạch máu", "resection": "Cắt bỏ", "emr": "Cắt hớt niêm mạc (EMR)",
+    "esd": "Cắt tách dưới niêm mạc (ESD)", "screening": "Tầm soát", "detection": "Phát hiện", "diagnosis": "Chẩn đoán"
 }
 
-class VideoRequest(BaseModel):
-    url: str
-
-class BatchTranslateRequest(BaseModel):
-    texts: list[str]
-
+class VideoRequest(BaseModel): url: str
+class RawSubsRequest(BaseModel):
+    video_id: str
+    subtitles: list[dict]
+class BatchTranslateRequest(BaseModel): texts: list[str]
 class WordRequest(BaseModel):
     word: str
     context_sentence: str
     context_vi: str = ""
 
 def extract_youtube_id(url: str):
-    pattern = r"(?:v=|\/|youtu\.be\/|embed\/|shorts\/)([0-9A-Za-z_-]{11})"
-    match = re.search(pattern, url)
-    return match.group(1) if match else None
+    m = re.search(r"(?:v=|\/|youtu\.be\/|embed\/|shorts\/)([0-9A-Za-z_-]{11})", url)
+    return m.group(1) if m else None
 
-def safe_request(method: str, url: str, **kwargs):
-    kwargs.setdefault("timeout", 10)
-    try:
-        return session.request(method, url, **kwargs)
-    except requests.exceptions.SSLError:
-        kwargs["verify"] = False
-        return session.request(method, url, **kwargs)
+def safe_req(method: str, url: str, **kw):
+    kw.setdefault("timeout", 9)
+    try: return session.request(method, url, **kw)
+    except Exception:
+        kw["verify"] = False
+        return session.request(method, url, **kw)
 
-def clean_subtitle_text(raw_text: str) -> str:
-    """Làm sạch mã HTML (&amp;, &#39;...) và các thẻ định dạng trong phụ đề."""
-    txt = html.unescape(raw_text or "")
-    txt = re.sub(r"<[^>]+>", " ", txt)
-    txt = txt.replace("\n", " ").strip()
-    return re.sub(r"\s+", " ", txt)
+def clean_txt(raw: str) -> str:
+    t = re.sub(r"<[^>]+>", " ", html.unescape(raw or "")).replace("\n", " ").strip()
+    return re.sub(r"\s+", " ", t)
 
-def parse_xml_or_json3_captions(content: str) -> list[dict]:
-    """Giải mã phụ đề định dạng JSON3 hoặc XML của YouTube."""
-    results = []
-    if not content or not content.strip():
-        return results
-
-    # 1. Thử parse định dạng JSON3
-    if content.strip().startswith("{"):
+def parse_captions(content: str) -> list[dict]:
+    res = []
+    if not content or not content.strip(): return res
+    c = content.strip()
+    if c.startswith("{"):
         try:
-            data = json.loads(content)
-            for ev in data.get("events", []):
-                segs = ev.get("segs", [])
-                if not segs:
-                    continue
-                txt = clean_subtitle_text("".join(s.get("utf8", "") for s in segs))
+            for ev in json.loads(c).get("events", []):
+                txt = clean_txt("".join(s.get("utf8", "") for s in ev.get("segs", [])))
                 if txt:
-                    start = float(ev.get("tStartMs", 0)) / 1000.0
-                    dur = float(ev.get("dDurationMs", 2500)) / 1000.0
-                    results.append({"text": txt, "start": round(start, 2), "duration": round(dur, 2)})
-            if results:
-                return results
-        except Exception:
-            pass
+                    res.append({"text": txt, "start": round(float(ev.get("tStartMs", 0))/1000, 2), "duration": round(float(ev.get("dDurationMs", 2500))/1000, 2)})
+            if res: return res
+        except Exception: pass
+    for s, d, t in re.findall(r'<text\s+start="([\d\.]+)"(?:\s+dur="([\d\.]+)")?[^>]*>(.*?)</text>', c, re.DOTALL):
+        txt = clean_txt(t)
+        if txt: res.append({"text": txt, "start": round(float(s), 2), "duration": round(float(d) if d else 2.5, 2)})
+    if res: return res
+    for s, d, t in re.findall(r'<p\s+t="(\d+)"(?:\s+d="(\d+)")?[^>]*>(.*?)</p>', c, re.DOTALL):
+        txt = clean_txt(t)
+        if txt: res.append({"text": txt, "start": round(float(s)/1000, 2), "duration": round(float(d)/1000 if d else 2.5, 2)})
+    return res
 
-    # 2. Parse định dạng XML chuẩn (<text start="..." dur="...">)
-    matches = re.findall(r'<text\s+start="([\d\.]+)"(?:\s+dur="([\d\.]+)")?[^>]*>(.*?)</text>', content, flags=re.DOTALL)
-    for start_s, dur_s, raw_t in matches:
-        txt = clean_subtitle_text(raw_t)
-        if txt:
-            start = float(start_s)
-            dur = float(dur_s) if dur_s else 2.5
-            results.append({"text": txt, "start": round(start, 2), "duration": round(dur, 2)})
-    if results:
-        return results
-
-    # 3. Parse định dạng XML srv3 (<p t="..." d="...">)
-    p_matches = re.findall(r'<p\s+t="(\d+)"(?:\s+d="(\d+)")?[^>]*>(.*?)</p>', content, flags=re.DOTALL)
-    for t_ms, d_ms, raw_t in p_matches:
-        txt = clean_subtitle_text(raw_t)
-        if txt:
-            start = float(t_ms) / 1000.0
-            dur = float(d_ms) / 1000.0 if d_ms else 2.5
-            results.append({"text": txt, "start": round(start, 2), "duration": round(dur, 2)})
-
-    return results
-
-def parse_vtt_time(ts: str) -> float:
-    parts = ts.strip().replace(",", ".").split(":")
-    if len(parts) == 3:
-        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-    elif len(parts) == 2:
-        return int(parts[0]) * 60 + float(parts[1])
-    return 0.0
-
-def parse_webvtt_captions(vtt_text: str) -> list[dict]:
-    """Giải mã phụ đề định dạng WebVTT từ Piped / Invidious."""
-    results = []
-    blocks = re.split(r"\n\s*\n", vtt_text.replace("\r\n", "\n"))
-    for block in blocks:
-        lines = [line.strip() for line in block.split("\n") if line.strip()]
-        if not lines:
-            continue
-        time_line_idx = -1
-        for idx, line in enumerate(lines):
-            if "-->" in line:
-                time_line_idx = idx
-                break
-        if time_line_idx == -1:
-            continue
-        time_parts = lines[time_line_idx].split("-->")
-        start_sec = parse_vtt_time(time_parts[0])
-        end_sec = parse_vtt_time(time_parts[1].split()[0])
-        dur_sec = max(round(end_sec - start_sec, 2), 1.2)
-        txt = clean_subtitle_text(" ".join(lines[time_line_idx + 1:]))
-        if txt and (not results or results[-1]["text"] != txt):
-            results.append({"text": txt, "start": round(start_sec, 2), "duration": dur_sec})
-    return results
+def extract_caption_url_from_html(html_str: str):
+    if not html_str or '"captionTracks":' not in html_str: return None
+    seg = html_str.split('"captionTracks":')[1].split('"translationLanguages"')[0]
+    fallback = None
+    for item in seg.split('{"baseUrl":"')[1:]:
+        u = item.split('"')[0].replace("\\u0026", "&").replace("\\/", "/")
+        if not fallback: fallback = u
+        m = re.search(r'"languageCode":"([^"]+)"', item)
+        if m and m.group(1).startswith("en"): return u
+    return fallback
 
 def fetch_youtube_subtitles(video_id: str) -> list[dict]:
-    """
-    Hệ thống lấy phụ đề 5 tầng chống chặn IP Cloud (Render / AWS / GCP).
-    """
-    errors = []
-
-    # TẦNG 1: Tactiq Transcript Cloud API (Hoạt động cực tốt trên IP Cloud Render)
-    for lang_code in ["en", "en-US", "en-GB"]:
+    # Tầng 1: Tactiq API với đầy đủ Origin/Referer header
+    for lc in ["en", "en-US", "en-GB"]:
         try:
-            r = safe_request(
-                "POST",
-                "https://tactiq-apps-prod.tactiq.io/transcript",
-                json={"videoUrl": f"https://www.youtube.com/watch?v={video_id}", "langCode": lang_code},
-                headers={"Content-Type": "application/json", "User-Agent": HEADERS["User-Agent"]},
-                timeout=8
-            )
-            if r.status_code == 200:
-                data = r.json()
-                captions = data.get("captions", [])
-                if captions:
+            r = safe_req("POST", "https://tactiq-apps-prod.tactiq.io/transcript",
+                         json={"videoUrl": f"https://www.youtube.com/watch?v={video_id}", "langCode": lc},
+                         headers={"Origin": "https://tactiq.io", "Referer": "https://tactiq.io/", "Content-Type": "application/json"})
+            if r.status_code == 200 and r.json().get("captions"):
+                subs = [{"text": clean_txt(c.get("text", "")), "start": round(float(c.get("start", 0)), 2), "duration": round(float(c.get("dur", 2.5)), 2)} for c in r.json()["captions"] if clean_txt(c.get("text", ""))]
+                if subs: return subs
+        except Exception: pass
+
+    # Tầng 2: NoteGPT API
+    try:
+        r = safe_req("GET", f"https://notegpt.io/api/v2/video-transcript?platform=youtube&video_id={video_id}",
+                     headers={"Referer": "https://notegpt.io/youtube-transcript-generator"})
+        if r.status_code == 200:
+            d = r.json().get("data", {})
+            tr_dict = d.get("transcripts", {})
+            for k in tr_dict:
+                items = tr_dict[k].get("custom") or tr_dict[k].get("default") or tr_dict[k].get("auto") or []
+                if isinstance(items, list) and items:
                     subs = []
-                    for c in captions:
-                        txt = clean_subtitle_text(c.get("text", ""))
+                    for it in items:
+                        txt = clean_txt(it.get("text", ""))
                         if txt:
-                            subs.append({
-                                "text": txt,
-                                "start": round(float(c.get("start", 0)), 2),
-                                "duration": round(float(c.get("dur", 2.5)), 2)
-                            })
-                    if subs:
-                        return subs
-        except Exception as e:
-            errors.append(f"Tactiq: {e}")
+                            st = float(it.get("start", 0) if str(it.get("start", "")).replace(".","").isdigit() else 0)
+                            subs.append({"text": txt, "start": round(st, 2), "duration": 2.8})
+                    if subs: return subs
+    except Exception: pass
 
-    # TẦNG 2: YouTubeTranscript Proxy Server
-    try:
-        r = safe_request("GET", f"https://youtubetranscript.com/?server_vid2={video_id}", timeout=8)
-        if r.status_code == 200 and "<text" in r.text and "<error>" not in r.text:
-            subs = parse_xml_or_json3_captions(r.text)
-            if subs:
-                return subs
-    except Exception as e:
-        errors.append(f"YTTranscriptProxy: {e}")
-
-    # TẦNG 3: YouTube InnerTube Mobile API (Giả lập client ANDROID_VR & IOS)
-    innertube_clients = [
-        {
-            "client": {
-                "clientName": "ANDROID_VR",
-                "clientVersion": "1.60.19",
-                "androidSdkVersion": 34,
-                "userAgent": "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 14; en_US; Quest 3; Build/UP1A.231005.007.A1; Cronet/132.0.6808.3)",
-                "hl": "en",
-                "gl": "US"
-            }
-        },
-        {
-            "client": {
-                "clientName": "IOS",
-                "clientVersion": "19.45.4",
-                "deviceMake": "Apple",
-                "deviceModel": "iPhone16,2",
-                "userAgent": "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
-                "hl": "en",
-                "gl": "US"
-            }
-        }
+    # Tầng 3: Proxy 2 bước đồng bộ chữ ký IP (CodeTabs, AllOrigins, CorsProxy)
+    watch_url = f"https://www.youtube.com/watch?v={video_id}&hl=en"
+    relays = [
+        lambda u: f"https://api.codetabs.com/v1/proxy?quest={urllib.parse.quote(u, safe='')}",
+        lambda u: f"https://api.allorigins.win/raw?url={urllib.parse.quote(u, safe='')}",
+        lambda u: f"https://corsproxy.io/?url={urllib.parse.quote(u, safe='')}"
     ]
-    for ctx in innertube_clients:
+    for make_relay in relays:
         try:
-            r = safe_request(
-                "POST",
-                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-                json={"videoId": video_id, "context": ctx},
-                headers={"Content-Type": "application/json", "User-Agent": ctx["client"]["userAgent"]},
-                timeout=7
-            )
-            if r.status_code == 200:
-                p_data = r.json()
-                tracks = (
-                    p_data.get("captions", {})
-                    .get("playerCaptionsTracklistRenderer", {})
-                    .get("captionTracks", [])
-                )
-                if tracks:
-                    chosen_track = tracks[0]
-                    for tr in tracks:
-                        if tr.get("languageCode", "").startswith("en"):
-                            chosen_track = tr
-                            break
-                    base_url = chosen_track.get("baseUrl", "")
-                    if base_url:
-                        sub_r = safe_request("GET", base_url + "&fmt=json3", timeout=7)
-                        subs = parse_xml_or_json3_captions(sub_r.text)
-                        if not subs:
-                            sub_r2 = safe_request("GET", base_url, timeout=7)
-                            subs = parse_xml_or_json3_captions(sub_r2.text)
-                        if subs:
-                            return subs
-        except Exception as e:
-            errors.append(f"InnerTube: {e}")
+            r1 = safe_req("GET", make_relay(watch_url), timeout=10)
+            if r1.status_code == 200 and '"captionTracks":' in r1.text:
+                cap_url = extract_caption_url_from_html(r1.text)
+                if cap_url:
+                    r2 = safe_req("GET", make_relay(cap_url + "&fmt=json3"), timeout=10)
+                    subs = parse_captions(r2.text)
+                    if not subs:
+                        r3 = safe_req("GET", make_relay(cap_url), timeout=10)
+                        subs = parse_captions(r3.text)
+                    if subs: return subs
+        except Exception: pass
 
-    # TẦNG 4: Hệ thống Piped & Invidious Cloud APIs
-    piped_instances = [
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.leptons.xyz",
-        "https://api.piped.private.coffee"
-    ]
-    for instance in piped_instances:
+    # Tầng 4: YouTube TV Embedded & Web Embedded Client
+    for c_name, c_ver in [("TVHTML5_SIMPLY_EMBEDDED_PLAYER", "2.0"), ("WEB_EMBEDDED_PLAYER", "1.20250101.01.00")]:
         try:
-            r = safe_request("GET", f"{instance}/streams/{video_id}", timeout=6)
-            if r.status_code == 200:
-                subtitles_list = r.json().get("subtitles", [])
-                if subtitles_list:
-                    chosen = subtitles_list[0]
-                    for s in subtitles_list:
-                        if s.get("code", "").startswith("en"):
-                            chosen = s
-                            break
-                    sub_url = chosen.get("url")
-                    if sub_url:
-                        sr = safe_request("GET", sub_url, timeout=6)
-                        subs = parse_webvtt_captions(sr.text) if "WEBVTT" in sr.text[:30] else parse_xml_or_json3_captions(sr.text)
-                        if subs:
-                            return subs
-        except Exception as e:
-            errors.append(f"Piped({instance}): {e}")
+            ctx = {"client": {"clientName": c_name, "clientVersion": c_ver, "hl": "en", "gl": "US"}, "thirdParty": {"embedUrl": "https://www.youtube.com/"}}
+            r = safe_req("POST", "https://www.youtube.com/youtubei/v1/player?prettyPrint=false", json={"videoId": video_id, "context": ctx})
+            if r.status_code == 200 and '"captionTracks":' in r.text:
+                cap_url = extract_caption_url_from_html(r.text)
+                if cap_url:
+                    subs = parse_captions(safe_req("GET", cap_url + "&fmt=json3").text) or parse_captions(safe_req("GET", cap_url).text)
+                    if subs: return subs
+        except Exception: pass
 
-    invidious_instances = [
-        "https://inv.nadeko.net",
-        "https://invidious.nerdvpn.de",
-        "https://yewtu.be"
-    ]
-    for inv in invidious_instances:
+    raise RuntimeError("NEED_CLIENT_FETCH")
+
+def clean_fillers(t: str) -> str:
+    c = re.sub(r"\s+", " ", re.sub(r"\b(uh+|um+|er+|erm+|ah+|hmm+)\b", "", t, flags=re.I)).strip()
+    return c if c else t.strip()
+
+def raw_gtrans(block: str) -> str:
+    if not block or not block.strip(): return block
+    for url, client in [("https://translate.googleapis.com/translate_a/single", "gtx"), ("https://clients5.google.com/translate_a/t", "dict-chrome-ex")]:
         try:
-            r = safe_request("GET", f"{inv}/api/v1/captions/{video_id}", timeout=6)
+            r = safe_req("POST", url, params={"client": client, "sl": "en", "tl": "vi", "dt": "t"}, data={"q": block})
             if r.status_code == 200:
-                caps = r.json().get("captions", [])
-                if caps:
-                    chosen_label = caps[0].get("label", "")
-                    for c in caps:
-                        if c.get("language_code", "").startswith("en"):
-                            chosen_label = c.get("label", "")
-                            break
-                    if chosen_label:
-                        vtt_r = safe_request("GET", f"{inv}/api/v1/captions/{video_id}", params={"label": chosen_label}, timeout=6)
-                        subs = parse_webvtt_captions(vtt_r.text)
-                        if subs:
-                            return subs
-        except Exception as e:
-            errors.append(f"Invidious({inv}): {e}")
+                d = r.json()
+                if client == "gtx" and d and d[0]:
+                    return "".join([p[0] for p in d[0] if p and p[0]]).strip()
+                elif isinstance(d, list) and d:
+                    return (d[0] if isinstance(d[0], str) else d[0][0]).strip()
+        except Exception: pass
+    return block
 
-    # TẦNG 5: Thư viện youtube-transcript-api mặc định
-    langs = ['en', 'en-US', 'en-GB']
-    if hasattr(YouTubeTranscriptApi, "get_transcript"):
-        return YouTubeTranscriptApi.get_transcript(video_id, languages=langs)
-    else:
-        api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id, languages=langs)
-        return [{"text": s.text, "start": s.start, "duration": s.duration} for s in fetched]
+def translate_single(t: str) -> str:
+    c = clean_fillers(t.strip())
+    low = SPEECH_FIX.get(c.lower().rstrip("."), c.lower().rstrip("."))
+    if low in MEDICAL_DICT: return MEDICAL_DICT[low]
+    res = raw_gtrans(c)
+    return res if res else t
 
-def clean_spoken_fillers(text: str) -> str:
-    """Loại bỏ các từ đệm 'uh', 'um', 'er' trong hội nghị để dịch tiếng Việt tự nhiên hơn."""
-    cleaned = re.sub(r"\b(uh+|um+|er+|erm+|ah+|hmm+)\b", "", text, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned if cleaned else text.strip()
-
-def raw_google_translate(text_block: str) -> str:
-    if not text_block or not text_block.strip():
-        return text_block
-
-    # 1. Endpoint GTX qua POST
-    try:
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {"client": "gtx", "sl": "en", "tl": "vi", "dt": "t"}
-        r = safe_request("POST", url, params=params, data={"q": text_block})
-        if r.status_code == 200:
-            data = r.json()
-            if data and data[0]:
-                res = "".join([part[0] for part in data[0] if part and part[0]])
-                if res.strip():
-                    return res.strip()
-    except Exception:
-        pass
-
-    # 2. Endpoint Clients5 qua POST
-    try:
-        url = "https://clients5.google.com/translate_a/t"
-        params = {"client": "dict-chrome-ex", "sl": "en", "tl": "vi"}
-        r = safe_request("POST", url, params=params, data={"q": text_block})
-        if r.status_code == 200:
-            data = r.json()
-            if isinstance(data, list) and data:
-                if isinstance(data[0], str):
-                    return data[0].strip()
-                elif isinstance(data[0], list) and data[0][0]:
-                    return data[0][0].strip()
-    except Exception:
-        pass
-
-    return text_block
-
-def translate_single_text(text: str) -> str:
-    if not text or not text.strip():
-        return text
-    clean_t = clean_spoken_fillers(text.strip())
-    lower_t = clean_t.lower().rstrip(".")
-    if lower_t in SPEECH_TO_TEXT_FIX:
-        lower_t = SPEECH_TO_TEXT_FIX[lower_t]
-    if lower_t in MEDICAL_DICT:
-        return MEDICAL_DICT[lower_t]
-
-    res = raw_google_translate(clean_t)
-    if res and res.lower() != clean_t.lower():
-        return res
-
-    if len(clean_t) < 450:
-        try:
-            r = safe_request("GET", "https://api.mymemory.translated.net/get", params={"q": clean_t, "langpair": "en|vi"})
-            if r.status_code == 200:
-                mm = r.json().get("responseData", {}).get("translatedText", "")
-                if mm:
-                    return mm.strip()
-        except Exception:
-            pass
-    return text
-
-def translate_indexed_chunk(chunk_texts: list[str]) -> list[str]:
-    """Dịch gộp 1 lô câu bằng nhãn [0], [1], [2]... tránh gộp dòng."""
-    if not chunk_texts:
-        return []
-
-    formatted_lines = []
-    for idx, t in enumerate(chunk_texts):
-        cleaned = clean_spoken_fillers(t)
-        if not cleaned:
-            cleaned = "..."
-        if cleaned[-1] not in ".?!":
-            cleaned_with_dot = cleaned + "."
-        else:
-            cleaned_with_dot = cleaned
-        formatted_lines.append(f"[{idx}] {cleaned_with_dot}")
-
-    payload = "\n".join(formatted_lines)
-    translated_block = raw_google_translate(payload)
-
-    matches = re.findall(r"\[\s*(\d+)\s*\]\s*(.*?)(?=\[\s*\d+\s*\]|$)", translated_block, flags=re.DOTALL)
-    result_map = {}
-    for idx_str, trans_val in matches:
-        i = int(idx_str)
-        val = trans_val.strip()
-        if i < len(chunk_texts) and not chunk_texts[i].strip().endswith("."):
-            val = val.rstrip(".")
-        result_map[i] = val.strip()
-
-    final_results = []
-    for i, orig in enumerate(chunk_texts):
-        lower_orig = orig.lower().strip().rstrip(".")
-        if lower_orig in MEDICAL_DICT:
-            final_results.append(MEDICAL_DICT[lower_orig])
-            continue
-
-        trans = result_map.get(i, "")
-        if not trans or trans.lower() == clean_spoken_fillers(orig).lower():
-            trans = translate_single_text(orig)
-        final_results.append(trans if trans else orig)
-
-    return final_results
-
-def translate_list_in_batches(texts: list[str], batch_size: int = 35) -> list[str]:
-    all_translated = []
+def translate_batch_list(texts: list[str], batch_size: int = 35) -> list[str]:
+    out = []
     for i in range(0, len(texts), batch_size):
         chunk = texts[i:i + batch_size]
-        all_translated.extend(translate_indexed_chunk(chunk))
-        if i + batch_size < len(texts):
-            time.sleep(0.1)
-    return all_translated
+        lines = [f"[{idx}] {clean_fillers(x) + ('.' if clean_fillers(x)[-1:] not in '.?!' else '')}" for idx, x in enumerate(chunk)]
+        trans_block = raw_gtrans("\n".join(lines))
+        rmap = {int(k): v.strip().rstrip(".") for k, v in re.findall(r"\[\s*(\d+)\s*\]\s*(.*?)(?=\[\s*\d+\s*\]|$)", trans_block, re.DOTALL)}
+        for idx, orig in enumerate(chunk):
+            low = orig.lower().strip().rstrip(".")
+            if low in MEDICAL_DICT: out.append(MEDICAL_DICT[low])
+            else:
+                val = rmap.get(idx, "")
+                out.append(val if (val and val.lower() != clean_fillers(orig).lower()) else translate_single(orig))
+        if i + batch_size < len(texts): time.sleep(0.08)
+    return out
+
+def prepare_initial_subs(vid: str, raw_subs: list[dict]):
+    subs = raw_subs[:3000]
+    for s in subs: s["text"] = clean_txt(s.get("text", "")) or "..."
+    init_n = min(100, len(subs))
+    init_vi = translate_batch_list([subs[i]["text"] for i in range(init_n)])
+    for i, s in enumerate(subs):
+        s["vi"] = init_vi[i] if i < init_n else "⏳ Đang dịch tự động..."
+        s["translated"] = (i < init_n)
+    return {"video_id": vid, "subtitles": subs}
 
 @app.get("/api/tts")
-async def text_to_speech(text: str = Query(..., max_length=500)):
-    """API tạo giọng đọc Thuyết minh Cabin Tiếng Việt mượt mà từ Google TTS."""
-    clean_t = text.replace("⏳", "").strip()
-    if not clean_t:
-        return Response(status_code=204)
-
-    if len(clean_t) > 200:
-        clean_t = clean_t[:197] + "..."
-
-    tts_urls = [
-        "https://translate.googleapis.com/translate_tts",
-        "https://translate.google.com/translate_tts"
-    ]
-    for url in tts_urls:
-        try:
-            params = {
-                "ie": "UTF-8",
-                "q": clean_t,
-                "tl": "vi",
-                "client": "tw-ob",
-                "ttsspeed": "1"
-            }
-            r = safe_request("GET", url, params=params, timeout=6)
-            if r.status_code == 200 and r.content:
-                return Response(
-                    content=r.content,
-                    media_type="audio/mpeg",
-                    headers={"Cache-Control": "public, max-age=86400"}
-                )
-        except Exception:
-            pass
-
+async def tts(text: str = Query(..., max_length=500)):
+    c = text.replace("⏳", "").strip()[:195]
+    if not c: return Response(status_code=204)
+    try:
+        r = safe_req("GET", "https://translate.googleapis.com/translate_tts", params={"ie": "UTF-8", "q": c, "tl": "vi", "client": "tw-ob"})
+        if r.status_code == 200 and r.content:
+            return Response(content=r.content, media_type="audio/mpeg", headers={"Cache-Control": "public, max-age=86400"})
+    except Exception: pass
     return Response(status_code=502)
 
 @app.post("/api/process-video")
 async def process_video(req: VideoRequest):
-    video_id = extract_youtube_id(req.url)
-    if not video_id:
-        return {"error": "Link YouTube không hợp lệ!"}
-
+    vid = extract_youtube_id(req.url)
+    if not vid: return {"error": "Link YouTube không hợp lệ!"}
     try:
-        raw_transcript = fetch_youtube_subtitles(video_id)
-        subtitles = raw_transcript[:3000]
+        subs = fetch_youtube_subtitles(vid)
+        return prepare_initial_subs(vid, subs)
+    except Exception:
+        return {"need_client_fetch": True, "video_id": vid}
 
-        for item in subtitles:
-            clean_t = item["text"].replace("\n", " ").strip()
-            item["text"] = clean_t if clean_t else "..."
-
-        initial_count = min(100, len(subtitles))
-        initial_texts = [subtitles[i]["text"] for i in range(initial_count)]
-        initial_vi = translate_list_in_batches(initial_texts, batch_size=35)
-
-        for i, item in enumerate(subtitles):
-            if i < initial_count:
-                item["vi"] = initial_vi[i]
-                item["translated"] = True
-            else:
-                item["vi"] = "⏳ Đang dịch tự động..."
-                item["translated"] = False
-
-        return {"video_id": video_id, "subtitles": subtitles}
-    except Exception as e:
-        return {"error": f"Video này không có phụ đề tiếng Anh hoặc tạm thời bị giới hạn. Chi tiết: {str(e)}"}
+@app.post("/api/process-raw-subtitles")
+async def process_raw_subtitles(req: RawSubsRequest):
+    if not req.subtitles: return {"error": "Không tìm thấy phụ đề tiếng Anh trên video này."}
+    return prepare_initial_subs(req.video_id, req.subtitles)
 
 @app.post("/api/translate-batch")
 async def api_translate_batch(req: BatchTranslateRequest):
-    try:
-        translated = translate_list_in_batches(req.texts, batch_size=40)
-        return {"translations": translated}
-    except Exception as e:
-        return {"error": str(e), "translations": req.texts}
-
-def get_word_candidates(word: str) -> list[str]:
-    w = word.lower().strip()
-    candidates = [w]
-    if w in SPEECH_TO_TEXT_FIX:
-        candidates.insert(0, SPEECH_TO_TEXT_FIX[w])
-
-    base_list = list(candidates)
-    for item in base_list:
-        if item.endswith("ies") and len(item) > 4:
-            candidates.append(item[:-3] + "y")
-        if item.endswith("es") and len(item) > 3:
-            candidates.append(item[:-2])
-        if item.endswith("s") and not item.endswith("ss") and len(item) > 2:
-            candidates.append(item[:-1])
-        if item.endswith("ed") and len(item) > 3:
-            candidates.extend([item[:-2], item[:-1]])
-        if item.endswith("ing") and len(item) > 4:
-            candidates.extend([item[:-3], item[:-3] + "e"])
-    return list(dict.fromkeys(candidates))
+    return {"translations": translate_batch_list(req.texts, batch_size=40)}
 
 @app.post("/api/lookup-word")
 async def lookup_word(req: WordRequest):
-    clean_w = req.word.strip()
-    lower_w = clean_w.lower()
-    candidates = get_word_candidates(clean_w)
+    w = req.word.strip()
+    low = w.lower()
+    cands = [SPEECH_FIX.get(low, low), low]
+    for base in list(cands):
+        if base.endswith("ies"): cands.append(base[:-3] + "y")
+        if base.endswith("es"): cands.append(base[:-2])
+        if base.endswith("s") and not base.endswith("ss"): cands.append(base[:-1])
+        if base.endswith("ed"): cands.extend([base[:-2], base[:-1]])
+        if base.endswith("ing"): cands.extend([base[:-3], base[:-3] + "e"])
 
-    ipa = "..."
-    pos = "Từ vựng"
-    en_def = ""
-    audio_url = ""
-    matched_dict_word = clean_w
-
-    for cand in candidates:
+    ipa, pos, en_def, audio = "...", "Từ vựng", "", ""
+    for c in dict.fromkeys(cands):
         try:
-            r = safe_request("GET", f"https://api.dictionaryapi.dev/api/v2/entries/en/{cand}", timeout=4)
+            r = safe_req("GET", f"https://api.dictionaryapi.dev/api/v2/entries/en/{c}", timeout=4)
             if r.status_code == 200:
                 d = r.json()[0]
-                matched_dict_word = cand
-                ipa = d.get("phonetic", "").strip("/")
-                if not ipa and d.get("phonetics"):
-                    for p in d["phonetics"]:
-                        if p.get("text"):
-                            ipa = p["text"].strip("/")
-                            break
-                for p in d.get("phonetics", []):
-                    if p.get("audio"):
-                        audio_url = p["audio"]
-                        if "-us.mp3" in audio_url:
-                            break
+                ipa = d.get("phonetic", "").strip("/") or next((p.get("text", "").strip("/") for p in d.get("phonetics", []) if p.get("text")), "...")
+                audio = next((p.get("audio") for p in d.get("phonetics", []) if p.get("audio")), "")
                 if d.get("meanings"):
                     pos = d["meanings"][0].get("partOfSpeech", "Từ vựng")
                     en_def = d["meanings"][0]["definitions"][0].get("definition", "")
                 break
-        except Exception:
-            pass
+        except Exception: pass
 
-    med_meaning = None
-    for cand in candidates:
-        if cand in MEDICAL_DICT:
-            med_meaning = MEDICAL_DICT[cand]
-            pos = "Thuật ngữ Y khoa" if pos == "Từ vựng" else f"{pos} • Y khoa"
-            break
+    med = next((MEDICAL_DICT[c] for c in cands if c in MEDICAL_DICT), None)
+    if med: pos = "Thuật ngữ Y khoa"
+    gen = translate_single(SPEECH_FIX.get(low, w))
+    vi_w = f"{med} ({gen})" if (med and gen.lower() not in med.lower() and gen.lower() != low) else (med or gen)
+    vi_sen = req.context_vi if (req.context_vi and "⏳" not in req.context_vi) else translate_single(req.context_sentence)
+    exp = (f"• Định nghĩa: {en_def}\n" if en_def else "") + f"• Dịch câu: \"{vi_sen}\""
+    return {"word": w, "ipa": ipa, "pos": pos, "meaning": vi_w, "explanation": exp, "audio": audio}
 
-    lookup_target = SPEECH_TO_TEXT_FIX.get(lower_w, clean_w)
-    general_meaning = translate_single_text(lookup_target)
-
-    if med_meaning:
-        if general_meaning.lower() != lookup_target.lower() and general_meaning.lower() not in med_meaning.lower():
-            vi_word = f"{med_meaning} ({general_meaning})"
-        else:
-            vi_word = med_meaning
-    else:
-        vi_word = general_meaning
-
-    vi_sentence = req.context_vi if (req.context_vi and "⏳" not in req.context_vi) else ""
-    if not vi_sentence or vi_sentence.lower() == req.context_sentence.lower():
-        vi_sentence = translate_single_text(req.context_sentence)
-
-    explain_parts = []
-    if lower_w in SPEECH_TO_TEXT_FIX:
-        explain_parts.append(f"• Lưu ý: Phụ đề tự động ghi \"{clean_w}\" (viết chuẩn Y khoa là \"{SPEECH_TO_TEXT_FIX[lower_w]}\").")
-    if en_def:
-        explain_parts.append(f"• Định nghĩa gốc: {en_def}")
-    explain_parts.append(f"• Dịch câu: \"{vi_sentence}\"")
-
-    display_word = f"{clean_w} ({matched_dict_word})" if lower_w in SPEECH_TO_TEXT_FIX else clean_w
-
-    return {
-        "word": display_word,
-        "ipa": ipa or "...",
-        "pos": pos,
-        "meaning": vi_word,
-        "explanation": "\n".join(explain_parts),
-        "audio": audio_url
-    }
-
-HTML_CONTENT = """
-<!DOCTYPE html>
+HTML_CONTENT = """<!DOCTYPE html>
 <html lang="vi">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <meta name="theme-color" content="#020617">
-  <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="referrer" content="strict-origin-when-cross-origin">
-  <title>MedLingua AI - Học Tiếng Anh & Dịch Cabin</title>
+  <title>MedLingua AI - Dịch Cabin & Học Tiếng Anh</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    * { -webkit-tap-highlight-color: transparent; }
-    body { touch-action: manipulation; }
-    .word-span {
-      cursor: pointer;
-      padding: 2px 4px;
-      margin: 0 -1px;
-      border-radius: 5px;
-      transition: all 0.15s;
-      display: inline-block;
-    }
-    .word-span:hover, .word-span:active {
-      background-color: #fde047;
-      color: #000;
-      font-weight: 600;
-    }
-    .active-sub {
-      background-color: #1e3a8a !important;
-      border-left: 4px solid #38bdf8 !important;
-    }
-    .cabin-glow {
-      box-shadow: 0 0 18px rgba(16, 185, 129, 0.35);
-      border-color: #10b981 !important;
-    }
-    ::-webkit-scrollbar { width: 5px; height: 5px; }
-    ::-webkit-scrollbar-track { background: #0f172a; }
-    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    .word-span { cursor: pointer; padding: 2px 4px; border-radius: 4px; display: inline-block; }
+    .word-span:hover, .word-span:active { background: #fde047; color: #000; font-weight: 600; }
+    .active-sub { background: #1e3a8a !important; border-left: 4px solid #38bdf8 !important; }
+    .cabin-glow { box-shadow: 0 0 15px rgba(16,185,129,0.35); border-color: #10b981 !important; }
   </style>
 </head>
 <body class="bg-slate-950 text-slate-100 min-h-screen pb-6 lg:p-6">
-  <div class="max-w-7xl mx-auto">
+  <div class="max-w-7xl mx-auto px-2 sm:px-4">
+    <header class="border-b border-slate-800 py-3 mb-3 flex justify-between items-center">
+      <h1 class="text-lg sm:text-2xl font-bold text-blue-400">🎬 MedLingua AI <span class="text-xs bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full">Cabin • Mobile & PC</span></h1>
+    </header>
 
-    <!-- HEADER & Ô DÁN LINK -->
-    <div class="p-3 sm:p-4 lg:p-0">
-      <header class="border-b border-slate-800 pb-3 mb-3 flex flex-wrap justify-between items-center gap-2">
-        <div>
-          <h1 class="text-lg sm:text-2xl font-bold text-blue-400 flex items-center gap-2">
-            🎬 MedLingua AI
-            <span class="text-[11px] sm:text-xs bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full font-normal">
-              Dịch Cabin • Mobile & PC
-            </span>
-          </h1>
-          <p class="text-xs sm:text-sm text-slate-400 mt-0.5 hidden sm:block">
-            Vừa nghe tiếng Anh gốc vừa nghe thuyết minh Tiếng Việt • Chạm từng từ để tra nghĩa Y khoa
-          </p>
-        </div>
-      </header>
-
-      <div class="bg-slate-900 border border-slate-800 p-2.5 sm:p-4 rounded-xl mb-2 lg:mb-5">
-        <div class="flex flex-row gap-2">
-          <input id="videoUrl" type="text" placeholder="Dán link YouTube vào đây..." 
-                 class="flex-1 p-2.5 sm:p-3 rounded-lg bg-slate-950 border border-slate-700 text-white focus:outline-none focus:border-blue-500 text-xs sm:text-sm min-w-0">
-          <button onclick="analyzeVideo()" id="btnLoad"
-                  class="bg-blue-600 hover:bg-blue-500 active:bg-blue-700 px-3.5 sm:px-6 py-2.5 sm:py-3 rounded-lg font-semibold text-xs sm:text-sm transition shrink-0">
-            ⚡ Dịch Video
-          </button>
-        </div>
-      </div>
+    <div class="bg-slate-900 border border-slate-800 p-2.5 rounded-xl mb-3 flex gap-2">
+      <input id="videoUrl" type="text" placeholder="Dán link YouTube vào đây..." class="flex-1 p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-white text-xs sm:text-sm min-w-0">
+      <button onclick="analyzeVideo()" id="btnLoad" class="bg-blue-600 hover:bg-blue-500 px-4 py-2.5 rounded-lg font-semibold text-xs sm:text-sm shrink-0">⚡ Dịch Video</button>
     </div>
 
-    <!-- BỐ CỤC CHÍNH -->
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 lg:gap-6 px-2 sm:px-4 lg:px-0">
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 lg:gap-6">
+      <div class="lg:col-span-2 space-y-2.5 sticky top-0 z-30 bg-slate-950 pt-1 pb-2 lg:static">
+        <div class="aspect-video bg-black rounded-xl overflow-hidden border border-slate-800"><div id="player" class="w-full h-full"></div></div>
 
-      <!-- CỘT TRÁI: VIDEO + DỊCH CABIN -->
-      <div class="lg:col-span-2 space-y-2.5 sm:space-y-4 sticky top-0 z-30 bg-slate-950 pt-1 pb-2 lg:static lg:p-0">
-        <div class="aspect-video bg-black rounded-xl overflow-hidden border border-slate-800 shadow-2xl relative">
-          <div id="player" class="w-full h-full"></div>
-        </div>
-
-        <!-- BẢNG ĐIỀU KHIỂN DỊCH CABIN -->
-        <div id="cabinPanel" class="p-2.5 sm:p-4 rounded-xl bg-slate-900 border border-slate-800 transition-all">
-          <div class="flex flex-wrap items-center justify-between gap-2 sm:gap-3">
-            <button id="btnCabinToggle" onclick="toggleCabinMode()"
-                    class="w-full sm:w-auto justify-center bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 px-3.5 py-2 sm:py-2.5 rounded-xl font-bold text-xs sm:text-sm flex items-center gap-2 transition">
-              <span id="cabinDot" class="w-2.5 h-2.5 rounded-full bg-slate-500 shrink-0"></span>
+        <div id="cabinPanel" class="p-2.5 sm:p-3.5 rounded-xl bg-slate-900 border border-slate-800">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <button id="btnCabinToggle" onclick="toggleCabinMode()" class="w-full sm:w-auto justify-center bg-slate-800 text-slate-200 border border-slate-700 px-3.5 py-2 rounded-xl font-bold text-xs sm:text-sm flex items-center gap-2">
+              <span id="cabinDot" class="w-2.5 h-2.5 rounded-full bg-slate-500"></span>
               <span id="cabinBtnText">🎧 Bật Dịch Cabin (Nghe Song Song)</span>
             </button>
-
-            <div class="flex items-center justify-between w-full sm:w-auto gap-2 sm:gap-3 text-xs text-slate-300">
-              <div class="flex items-center gap-1.5 bg-slate-950 px-2.5 py-1.5 rounded-lg border border-slate-800 flex-1 sm:flex-initial justify-center">
-                <span class="text-[11px] sm:text-xs">🔊 Âm gốc:</span>
-                <input id="origVolSlider" type="range" min="5" max="70" value="20" 
-                       oninput="updateOrigVolLabel(this.value)" class="w-14 sm:w-20 accent-blue-500 cursor-pointer">
-                <span id="origVolValue" class="font-mono text-blue-400 font-bold text-[11px] sm:text-xs w-7">20%</span>
+            <div class="flex items-center justify-between w-full sm:w-auto gap-2 text-xs">
+              <div class="flex items-center gap-1.5 bg-slate-950 px-2.5 py-1.5 rounded-lg border border-slate-800">
+                <span>🔊 Âm gốc:</span>
+                <input type="range" min="5" max="70" value="20" oninput="updateOrigVol(this.value)" class="w-16 accent-blue-500">
+                <span id="origVolValue" class="text-blue-400 font-bold">20%</span>
               </div>
-
-              <div class="flex items-center gap-1 bg-slate-950 px-2.5 py-1.5 rounded-lg border border-slate-800">
-                <span class="text-[11px] sm:text-xs">🎙️ Tốc độ:</span>
-                <select id="cabinSpeed" onchange="updateCabinSpeed(this.value)" 
-                        class="bg-slate-900 text-emerald-400 font-bold text-[11px] sm:text-xs focus:outline-none cursor-pointer">
-                  <option value="1.05">1.0x</option>
-                  <option value="1.2" selected>1.2x</option>
-                  <option value="1.35">1.35x</option>
-                  <option value="1.5">1.5x</option>
-                </select>
-              </div>
+              <select onchange="cabinRate=parseFloat(this.value);cabinAudio.playbackRate=cabinRate;" class="bg-slate-950 text-emerald-400 font-bold px-2 py-1.5 rounded-lg border border-slate-800">
+                <option value="1.05">1.0x</option><option value="1.2" selected>1.2x</option><option value="1.35">1.35x</option>
+              </select>
             </div>
           </div>
-
-          <div id="cabinLiveBar" class="hidden mt-2 pt-2 border-t border-slate-800/80 flex items-center gap-2 text-xs sm:text-sm">
-            <span class="text-[10px] sm:text-xs bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded font-semibold shrink-0 animate-pulse">
-              🎙️ Cabin
-            </span>
-            <p id="cabinLiveText" class="text-emerald-400 font-medium truncate">...</p>
+          <div id="cabinLiveBar" class="hidden mt-2 pt-2 border-t border-slate-800 flex items-center gap-2 text-xs">
+            <span class="bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded font-semibold shrink-0">🎙️ Cabin</span>
+            <p id="cabinLiveText" class="text-emerald-400 truncate">...</p>
           </div>
         </div>
 
-        <!-- HỘP TRA TỪ ĐIỂN Y KHOA -->
-        <div id="wordBox" class="hidden fixed bottom-0 left-0 right-0 z-50 p-4 rounded-t-2xl bg-slate-900/95 backdrop-blur-md border-t-2 border-blue-500 shadow-[0_-10px_30px_rgba(0,0,0,0.8)] lg:static lg:z-auto lg:p-5 lg:rounded-xl lg:border lg:border-slate-800 lg:shadow-xl">
-          <div class="flex items-start justify-between gap-2 border-b border-slate-800 pb-2.5 mb-2.5">
+        <div id="wordBox" class="hidden fixed bottom-0 left-0 right-0 z-50 p-4 rounded-t-2xl bg-slate-900 border-t-2 border-blue-500 shadow-2xl lg:static lg:rounded-xl lg:border lg:border-slate-800">
+          <div class="flex justify-between items-start border-b border-slate-800 pb-2 mb-2">
             <div>
-              <div class="flex items-center gap-2 flex-wrap">
-                <span id="wText" class="text-xl sm:text-2xl font-bold text-yellow-400"></span>
-                <span id="wIpa" class="text-slate-400 font-mono text-xs sm:text-sm"></span>
-                <span id="wPos" class="text-[11px] sm:text-xs bg-slate-800 text-blue-300 px-2 py-0.5 rounded-full"></span>
-              </div>
-              <p id="wMeaning" class="text-lg sm:text-xl text-emerald-400 font-bold mt-1"></p>
+              <span id="wText" class="text-xl font-bold text-yellow-400"></span>
+              <span id="wIpa" class="text-slate-400 font-mono text-xs ml-2"></span>
+              <span id="wPos" class="text-xs bg-slate-800 text-blue-300 px-2 py-0.5 rounded-full ml-1"></span>
+              <p id="wMeaning" class="text-lg text-emerald-400 font-bold mt-1"></p>
             </div>
-
-            <button onclick="closeWordBox()" class="text-slate-400 hover:text-white bg-slate-800 hover:bg-slate-700 w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold shrink-0">
-              ✕
-            </button>
+            <button onclick="document.getElementById('wordBox').classList.add('hidden')" class="bg-slate-800 w-7 h-7 rounded-full text-sm font-bold">✕</button>
           </div>
-
-          <p id="wExplain" class="text-xs sm:text-sm text-slate-300 leading-relaxed whitespace-pre-line max-h-32 overflow-y-auto mb-3"></p>
-
+          <p id="wExplain" class="text-xs sm:text-sm text-slate-300 whitespace-pre-line mb-3"></p>
           <div class="flex gap-2">
-            <button id="btnDictAudio" onclick="playDictMp3()" class="hidden flex-1 sm:flex-initial justify-center bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 px-3 py-2 rounded-lg text-xs font-semibold transition flex items-center gap-1">
-              🎙️ Phát âm từ điển
-            </button>
-            <button onclick="playCurrentSentence()" class="flex-1 sm:flex-initial justify-center bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-xs font-semibold transition flex items-center gap-1">
-              🔊 Nghe lại câu gốc
-            </button>
+            <button id="btnDictAudio" onclick="dictAudio.play()" class="hidden bg-emerald-600/20 text-emerald-300 px-3 py-2 rounded-lg text-xs font-semibold">🎙️ Nghe MP3</button>
+            <button onclick="playCurrentSentence()" class="bg-blue-600 text-white px-4 py-2 rounded-lg text-xs font-semibold">🔊 Nghe câu gốc</button>
           </div>
         </div>
       </div>
 
-      <!-- CỘT PHẢI: DANH SÁCH PHỤ ĐỀ TƯƠNG TÁC -->
-      <div class="bg-slate-900 rounded-xl border border-slate-800 p-3 sm:p-4 h-[52vh] sm:h-[600px] lg:h-[650px] flex flex-col shadow-xl">
-        <div class="border-b border-slate-800 pb-2.5 mb-2.5 flex justify-between items-center gap-2">
-          <div>
-            <h2 class="font-bold text-slate-200 text-xs sm:text-sm">PHỤ ĐỀ SONG NGỮ TƯƠNG TÁC</h2>
-            <p class="text-[11px] sm:text-xs text-slate-400 mt-0.5">Chạm từ để tra nghĩa • Chạm 🎙️ để nghe Cabin</p>
-          </div>
-          <span id="subCount" class="text-[11px] sm:text-xs bg-slate-800 text-emerald-400 px-2.5 py-1 rounded font-medium shrink-0"></span>
+      <div class="bg-slate-900 rounded-xl border border-slate-800 p-3 h-[52vh] lg:h-[640px] flex flex-col">
+        <div class="border-b border-slate-800 pb-2 mb-2 flex justify-between items-center">
+          <span class="font-bold text-xs sm:text-sm">PHỤ ĐỀ SONG NGỮ TƯƠNG TÁC</span>
+          <span id="subCount" class="text-xs bg-slate-800 text-emerald-400 px-2 py-0.5 rounded"></span>
         </div>
-        <div id="subtitleList" class="flex-1 overflow-y-auto space-y-2 pr-1 relative">
-          <p class="text-slate-400 text-xs sm:text-sm text-center pt-16">Đang tải dữ liệu phụ đề song ngữ...</p>
-        </div>
+        <div id="subtitleList" class="flex-1 overflow-y-auto space-y-2 pr-1 relative"></div>
       </div>
-
     </div>
   </div>
 
   <script src="https://www.youtube.com/iframe_api"></script>
   <script>
-    let player;
-    let subtitles = [];
-    let activeTimer = null;
-    let activeSubIndex = 0;
-    let currentDictAudio = "";
-    let translationJobId = 0;
+    let player, subtitles = [], activeTimer = null, activeSubIndex = 0, jobId = 0;
+    let cabinEnabled = false, isSpeaking = false, lastSpokenIdx = -1, duckVol = 20, cabinRate = 1.2;
+    const cabinAudio = new Audio(), dictAudio = new Audio();
+    cabinAudio.playsInline = true; dictAudio.playsInline = true;
 
-    let cabinEnabled = false;
-    const cabinAudio = new Audio();
-    cabinAudio.playsInline = true;
-    const dictAudioPlayer = new Audio();
-    dictAudioPlayer.playsInline = true;
+    function onYouTubeIframeAPIReady() { processUrlOrId("https://www.youtube.com/watch?v=gedoSfZvBgE"); }
 
-    let isCabinSpeaking = false;
-    let lastCabinSpokenIdx = -1;
-    let origDuckVolume = 20;
-    let cabinSpeechRate = 1.2;
-
-    function onYouTubeIframeAPIReady() {
-      loadVideoDirect("gedoSfZvBgE");
-    }
-
-    async function loadVideoDirect(videoId) {
-      const res = await fetch("/api/process-video", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: "https://www.youtube.com/watch?v=" + videoId })
-      });
-      const data = await res.json();
-      if (!data.error) {
-        subtitles = data.subtitles;
-        lastCabinSpokenIdx = -1;
-        initPlayer(data.video_id);
-        renderSubtitles();
-        startBackgroundTranslation();
-      }
-    }
-
-    function initPlayer(videoId) {
-      if (player && player.loadVideoById) {
-        player.loadVideoById(videoId);
-      } else {
-        player = new YT.Player('player', {
-          height: '100%',
-          width: '100%',
-          videoId: videoId,
-          playerVars: { 'playsinline': 1, 'rel': 0 },
-          events: {
-            'onStateChange': onPlayerStateChange
+    function parseCapData(str) {
+      const res = [];
+      if (!str || !str.trim()) return res;
+      if (str.trim().startsWith("{")) {
+        try {
+          const evs = JSON.parse(str).events || [];
+          for (const ev of evs) {
+            const txt = (ev.segs || []).map(s => s.utf8 || "").join("").replace(/\n/g, " ").trim();
+            if (txt) res.push({text: txt, start: +(ev.tStartMs/1000).toFixed(2), duration: +((ev.dDurationMs||2500)/1000).toFixed(2)});
           }
+          if (res.length) return res;
+        } catch(e){}
+      }
+      const doc = new DOMParser().parseFromString(str, "text/xml");
+      const nodes = doc.querySelectorAll("text, p");
+      nodes.forEach(n => {
+        const txt = (n.textContent || "").replace(/\n/g, " ").trim();
+        if (!txt) return;
+        const st = n.hasAttribute("start") ? parseFloat(n.getAttribute("start")) : parseFloat(n.getAttribute("t")||0)/1000;
+        const du = n.hasAttribute("dur") ? parseFloat(n.getAttribute("dur")) : parseFloat(n.getAttribute("d")||2500)/1000;
+        res.push({text: txt, start: +st.toFixed(2), duration: +(du||2.5).toFixed(2)});
+      });
+      return res;
+    }
+
+    async function fetchFromPhoneBrowser(vid) {
+      // 1. Thử Tactiq trực tiếp từ mạng 4G/Wi-Fi của điện thoại
+      try {
+        const r = await fetch("https://tactiq-apps-prod.tactiq.io/transcript", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({videoUrl: "https://www.youtube.com/watch?v=" + vid, langCode: "en"})
         });
+        if (r.ok) {
+          const d = await r.json();
+          if (d.captions && d.captions.length) {
+            return d.captions.map(c => ({text: c.text, start: +parseFloat(c.start||0).toFixed(2), duration: +parseFloat(c.dur||2.5).toFixed(2)}));
+          }
+        }
+      } catch(e){}
+
+      // 2. Thử lấy qua Proxy đồng bộ chữ ký IP từ trình duyệt điện thoại
+      const wUrl = "https://www.youtube.com/watch?v=" + vid + "&hl=en";
+      const proxies = [
+        u => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u),
+        u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u),
+        u => "https://corsproxy.io/?url=" + encodeURIComponent(u)
+      ];
+      for (const px of proxies) {
+        try {
+          const r1 = await fetch(px(wUrl));
+          const html = await r1.text();
+          if (html.includes('"captionTracks":')) {
+            const seg = html.split('"captionTracks":')[1].split('"translationLanguages"')[0];
+            const parts = seg.split('{"baseUrl":"').slice(1);
+            let capUrl = null;
+            for (const p of parts) {
+              const u = p.split('"')[0].replace(/\\u0026/g, "&").replace(/\\\//g, "/");
+              if (!capUrl) capUrl = u;
+              if (p.includes('"languageCode":"en')) { capUrl = u; break; }
+            }
+            if (capUrl) {
+              const r2 = await fetch(px(capUrl + "&fmt=json3"));
+              let subs = parseCapData(await r2.text());
+              if (!subs.length) {
+                const r3 = await fetch(px(capUrl));
+                subs = parseCapData(await r3.text());
+              }
+              if (subs.length) return subs;
+            }
+          }
+        } catch(e){}
+      }
+      return [];
+    }
+
+    async function processUrlOrId(url) {
+      const r = await fetch("/api/process-video", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({url})});
+      let d = await r.json();
+      if (d.need_client_fetch && d.video_id) {
+        initPlayer(d.video_id);
+        const rawSubs = await fetchFromPhoneBrowser(d.video_id);
+        if (rawSubs.length) {
+          const r2 = await fetch("/api/process-raw-subtitles", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({video_id: d.video_id, subtitles: rawSubs})});
+          d = await r2.json();
+        } else {
+          d = {error: "Video này không bật phụ đề (CC) hoặc tác giả đã tắt phụ đề."};
+        }
+      }
+      if (d.error) alert(d.error);
+      else if (d.subtitles) {
+        subtitles = d.subtitles; lastSpokenIdx = -1; initPlayer(d.video_id); renderSubs(); startBgTrans();
       }
     }
 
-    function onPlayerStateChange(event) {
-      if (event.data === YT.PlayerState.PAUSED || event.data === YT.PlayerState.ENDED) {
-        stopCabinAudio();
-      }
+    function initPlayer(vid) {
+      if (player && player.loadVideoById) player.loadVideoById(vid);
+      else player = new YT.Player('player', {height:'100%', width:'100%', videoId:vid, playerVars:{playsinline:1, rel:0}, events:{onStateChange: e => { if(e.data===2||e.data===0) stopCabin(); }}});
     }
 
-    function updateOrigVolLabel(val) {
-      origDuckVolume = parseInt(val, 10);
-      document.getElementById("origVolValue").innerText = `${origDuckVolume}%`;
-      if (cabinEnabled && player && player.setVolume) {
-        player.setVolume(isCabinSpeaking ? origDuckVolume : Math.min(origDuckVolume + 25, 80));
-      }
-    }
-
-    function updateCabinSpeed(val) {
-      cabinSpeechRate = parseFloat(val);
-      cabinAudio.playbackRate = cabinSpeechRate;
-    }
-
-    function unlockMobileAudio() {
-      cabinAudio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
-      cabinAudio.play().then(() => {
-        cabinAudio.pause();
-        cabinAudio.currentTime = 0;
-      }).catch(() => {});
+    function updateOrigVol(v) {
+      duckVol = parseInt(v, 10);
+      document.getElementById("origVolValue").innerText = duckVol + "%";
+      if (cabinEnabled && player && player.setVolume) player.setVolume(duckVol);
     }
 
     function toggleCabinMode() {
       cabinEnabled = !cabinEnabled;
-      const btn = document.getElementById("btnCabinToggle");
-      const dot = document.getElementById("cabinDot");
-      const text = document.getElementById("cabinBtnText");
-      const panel = document.getElementById("cabinPanel");
-      const liveBar = document.getElementById("cabinLiveBar");
-
+      const btn = document.getElementById("btnCabinToggle"), txt = document.getElementById("cabinBtnText");
+      const panel = document.getElementById("cabinPanel"), bar = document.getElementById("cabinLiveBar");
       if (cabinEnabled) {
-        unlockMobileAudio();
-        btn.className = "w-full sm:w-auto justify-center bg-emerald-600 hover:bg-emerald-500 text-white border border-emerald-400 px-3.5 py-2 sm:py-2.5 rounded-xl font-bold text-xs sm:text-sm flex items-center gap-2 transition shadow-lg";
-        dot.className = "w-2.5 h-2.5 rounded-full bg-white animate-ping shrink-0";
-        text.innerText = "🎧 Đang Bật Dịch Cabin (Chạm để tắt)";
-        panel.classList.add("cabin-glow");
-        liveBar.classList.remove("hidden");
-
-        lastCabinSpokenIdx = activeSubIndex - 1;
-        if (player && player.setVolume) {
-          player.setVolume(origDuckVolume);
-        }
-        triggerCabinIfNeeded();
+        cabinAudio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
+        cabinAudio.play().then(()=>{cabinAudio.pause();}).catch(()=>{});
+        btn.className = "w-full sm:w-auto justify-center bg-emerald-600 text-white px-3.5 py-2 rounded-xl font-bold text-xs sm:text-sm flex items-center gap-2";
+        txt.innerText = "🎧 Đang Bật Dịch Cabin (Chạm để tắt)";
+        panel.classList.add("cabin-glow"); bar.classList.remove("hidden");
+        lastSpokenIdx = activeSubIndex - 1;
+        if (player && player.setVolume) player.setVolume(duckVol);
+        triggerCabin();
       } else {
-        btn.className = "w-full sm:w-auto justify-center bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 px-3.5 py-2 sm:py-2.5 rounded-xl font-bold text-xs sm:text-sm flex items-center gap-2 transition";
-        dot.className = "w-2.5 h-2.5 rounded-full bg-slate-500 shrink-0";
-        text.innerText = "🎧 Bật Dịch Cabin (Nghe Song Song)";
-        panel.classList.remove("cabin-glow");
-        liveBar.classList.add("hidden");
-
-        stopCabinAudio();
-        if (player && player.setVolume) {
-          player.setVolume(100);
-        }
+        btn.className = "w-full sm:w-auto justify-center bg-slate-800 text-slate-200 border border-slate-700 px-3.5 py-2 rounded-xl font-bold text-xs sm:text-sm flex items-center gap-2";
+        txt.innerText = "🎧 Bật Dịch Cabin (Nghe Song Song)";
+        panel.classList.remove("cabin-glow"); bar.classList.add("hidden");
+        stopCabin();
+        if (player && player.setVolume) player.setVolume(100);
       }
     }
 
-    function stopCabinAudio() {
-      try {
-        cabinAudio.pause();
-      } catch (e) {}
-      if (window.speechSynthesis) {
-        window.speechSynthesis.cancel();
-      }
-      isCabinSpeaking = false;
-    }
+    function stopCabin() { try { cabinAudio.pause(); } catch(e){} isSpeaking = false; }
 
-    function speakCabinText(viText, onDoneCallback) {
-      if (!viText || viText.includes("⏳")) {
-        if (onDoneCallback) onDoneCallback();
-        return;
-      }
-
-      stopCabinAudio();
-      isCabinSpeaking = true;
+    function speakText(viText, cb) {
+      if (!viText || viText.includes("⏳")) { if (cb) cb(); return; }
+      stopCabin(); isSpeaking = true;
       document.getElementById("cabinLiveText").innerText = viText;
-
-      if (player && player.setVolume) {
-        player.setVolume(origDuckVolume);
-      }
-
-      cabinAudio.src = `/api/tts?text=${encodeURIComponent(viText)}`;
-      cabinAudio.playbackRate = cabinSpeechRate;
-
-      cabinAudio.onended = () => {
-        isCabinSpeaking = false;
-        if (cabinEnabled && player && player.setVolume) {
-          player.setVolume(Math.min(origDuckVolume + 20, 75));
-        }
-        if (onDoneCallback) onDoneCallback();
-      };
-
-      cabinAudio.onerror = () => {
-        if ('speechSynthesis' in window) {
-          const utter = new SpeechSynthesisUtterance(viText);
-          utter.lang = 'vi-VN';
-          utter.rate = cabinSpeechRate;
-          utter.onend = () => {
-            isCabinSpeaking = false;
-            if (onDoneCallback) onDoneCallback();
-          };
-          utter.onerror = () => {
-            isCabinSpeaking = false;
-            if (onDoneCallback) onDoneCallback();
-          };
-          window.speechSynthesis.speak(utter);
-        } else {
-          isCabinSpeaking = false;
-          if (onDoneCallback) onDoneCallback();
-        }
-      };
-
-      cabinAudio.play().catch(() => {
-        isCabinSpeaking = false;
-        if (onDoneCallback) onDoneCallback();
-      });
+      if (player && player.setVolume) player.setVolume(duckVol);
+      cabinAudio.src = "/api/tts?text=" + encodeURIComponent(viText);
+      cabinAudio.playbackRate = cabinRate;
+      cabinAudio.onended = () => { isSpeaking = false; if (cb) cb(); };
+      cabinAudio.onerror = () => { isSpeaking = false; if (cb) cb(); };
+      cabinAudio.play().catch(() => { isSpeaking = false; if (cb) cb(); });
     }
 
-    function triggerCabinIfNeeded() {
-      if (!cabinEnabled || isCabinSpeaking) return;
-      if (!player || !player.getPlayerState || player.getPlayerState() !== YT.PlayerState.PLAYING) return;
-
-      if (activeSubIndex > lastCabinSpokenIdx && subtitles[activeSubIndex]) {
-        let textToRead = "";
-        let targetIdx = activeSubIndex;
-
-        if (activeSubIndex - lastCabinSpokenIdx === 2 && subtitles[activeSubIndex - 1]) {
-          const prevVi = subtitles[activeSubIndex - 1].vi || "";
-          const currVi = subtitles[activeSubIndex].vi || "";
-          if (!prevVi.includes("⏳") && !currVi.includes("⏳") && (prevVi.length + currVi.length < 160)) {
-            textToRead = `${prevVi}, ${currVi}`;
-          } else {
-            textToRead = currVi;
-          }
-        } else {
-          textToRead = subtitles[activeSubIndex].vi || "";
+    function triggerCabin() {
+      if (!cabinEnabled || isSpeaking || !player || !player.getPlayerState || player.getPlayerState() !== 1) return;
+      if (activeSubIndex > lastSpokenIdx && subtitles[activeSubIndex]) {
+        let idx = activeSubIndex, txt = subtitles[idx].vi || "";
+        if (txt.length < 45 && idx + 1 < subtitles.length && subtitles[idx + 1].translated) {
+          txt += " " + subtitles[idx + 1].vi; idx++;
         }
-
-        if (
-          textToRead.length < 45 &&
-          targetIdx + 1 < subtitles.length &&
-          subtitles[targetIdx + 1].translated &&
-          (subtitles[targetIdx + 1].start - (subtitles[targetIdx].start + subtitles[targetIdx].duration)) < 1.0
-        ) {
-          textToRead = `${textToRead} ${subtitles[targetIdx + 1].vi}`;
-          targetIdx = targetIdx + 1;
-        }
-
-        lastCabinSpokenIdx = targetIdx;
-        speakCabinText(textToRead, () => {
-          if (cabinEnabled) {
-            setTimeout(triggerCabinIfNeeded, 80);
-          }
-        });
+        lastSpokenIdx = idx;
+        speakText(txt, () => { if (cabinEnabled) setTimeout(triggerCabin, 80); });
       }
     }
 
     async function analyzeVideo() {
       const url = document.getElementById("videoUrl").value.trim();
-      if (!url) return alert("Bạn hãy dán link YouTube vào ô trống nhé!");
-
+      if (!url) return alert("Hãy dán link YouTube!");
       const btn = document.getElementById("btnLoad");
-      btn.innerText = "⏳ Đang xử lý...";
-      btn.disabled = true;
-      stopCabinAudio();
-
-      try {
-        const res = await fetch("/api/process-video", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url })
-        });
-        const data = await res.json();
-        if (data.error) {
-          alert(data.error);
-        } else {
-          subtitles = data.subtitles;
-          lastCabinSpokenIdx = -1;
-          initPlayer(data.video_id);
-          renderSubtitles();
-          startBackgroundTranslation();
-        }
-      } catch (err) {
-        alert("Lỗi kết nối: " + err.message);
-      } finally {
-        btn.innerText = "⚡ Dịch Video";
-        btn.disabled = false;
-      }
+      btn.innerText = "⏳ Đang tải..."; btn.disabled = true; stopCabin();
+      try { await processUrlOrId(url); }
+      catch (e) { alert("Lỗi kết nối: " + e.message); }
+      finally { btn.innerText = "⚡ Dịch Video"; btn.disabled = false; }
     }
 
-    function updateProgressBadge() {
-      const total = subtitles.length;
-      const done = subtitles.filter(s => s.translated).length;
-      const badge = document.getElementById("subCount");
-      if (done < total) {
-        badge.innerText = `⚡ Đang dịch ${done}/${total}`;
-      } else {
-        badge.innerText = `${total} câu`;
-      }
-    }
-
-    async function startBackgroundTranslation() {
-      const currentJob = ++translationJobId;
-      updateProgressBadge();
-
-      const BATCH_SIZE = 40;
-      while (currentJob === translationJobId) {
-        let startIndex = -1;
-        for (let i = activeSubIndex; i < subtitles.length; i++) {
-          if (!subtitles[i].translated) {
-            startIndex = i;
-            break;
-          }
+    async function startBgTrans() {
+      const cur = ++jobId;
+      while (cur === jobId) {
+        const todo = [];
+        for (let i = 0; i < subtitles.length && todo.length < 40; i++) {
+          const idx = (activeSubIndex + i) % subtitles.length;
+          if (!subtitles[idx].translated) todo.push(idx);
         }
-        if (startIndex === -1) {
-          for (let i = 0; i < activeSubIndex; i++) {
-            if (!subtitles[i].translated) {
-              startIndex = i;
-              break;
-            }
-          }
-        }
-
-        if (startIndex === -1) break;
-
-        const batchIndices = [];
-        const batchTexts = [];
-        for (let i = startIndex; i < subtitles.length && batchIndices.length < BATCH_SIZE; i++) {
-          if (!subtitles[i].translated) {
-            batchIndices.push(i);
-            batchTexts.push(subtitles[i].text);
-          }
-        }
-
+        const done = subtitles.filter(s => s.translated).length;
+        document.getElementById("subCount").innerText = done < subtitles.length ? `⚡ ${done}/${subtitles.length}` : `${subtitles.length} câu`;
+        if (!todo.length) break;
         try {
-          const res = await fetch("/api/translate-batch", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ texts: batchTexts })
+          const r = await fetch("/api/translate-batch", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({texts: todo.map(i => subtitles[i].text)})});
+          const d = await r.json();
+          if (cur !== jobId) return;
+          (d.translations || []).forEach((vi, k) => {
+            const idx = todo[k]; subtitles[idx].vi = vi; subtitles[idx].translated = true;
+            const el = document.getElementById("sub-vi-" + idx); if (el) el.innerText = vi;
           });
-          const data = await res.json();
-          if (currentJob !== translationJobId) return;
-
-          if (data.translations && data.translations.length) {
-            batchIndices.forEach((subIdx, k) => {
-              const viText = data.translations[k] || subtitles[subIdx].text;
-              subtitles[subIdx].vi = viText;
-              subtitles[subIdx].translated = true;
-              const viEl = document.getElementById(`sub-vi-${subIdx}`);
-              if (viEl) viEl.innerText = viText;
-            });
-            updateProgressBadge();
-          }
-        } catch (err) {
-          await new Promise(r => setTimeout(r, 1000));
-        }
+        } catch (e) { await new Promise(r => setTimeout(r, 1000)); }
       }
     }
 
-    function renderSubtitles() {
-      const container = document.getElementById("subtitleList");
-      updateProgressBadge();
-      container.innerHTML = "";
-
-      subtitles.forEach((sub, index) => {
+    function renderSubs() {
+      const box = document.getElementById("subtitleList"); box.innerHTML = "";
+      subtitles.forEach((s, i) => {
         const div = document.createElement("div");
-        div.id = `sub-${index}`;
-        div.className = "p-2.5 sm:p-3 rounded-lg bg-slate-950/70 border border-slate-800/80 transition hover:bg-slate-800/60 cursor-pointer";
-
-        const wordsHtml = sub.text.split(" ").map(w => {
-          const cleanWord = w.replace(/[^a-zA-Z0-9-]/g, "");
-          return `<span class="word-span" onclick="lookupWord(event, '${cleanWord}', ${index})">${w}</span>`;
-        }).join(" ");
-
-        div.innerHTML = `
-          <div class="flex justify-between items-start gap-2">
-            <div class="text-sm sm:text-base font-medium text-slate-100 leading-relaxed">${wordsHtml}</div>
-            <div class="flex gap-1 shrink-0">
-              <button onclick="event.stopPropagation(); playCabinSingleSentence(${index})" 
-                      class="text-[11px] sm:text-xs bg-emerald-600/20 hover:bg-emerald-600 active:bg-emerald-700 text-emerald-300 hover:text-white px-2 py-1 rounded transition">
-                🎙️ Cabin
-              </button>
-              <button onclick="event.stopPropagation(); playSegment(${sub.start}, ${sub.duration}, ${index})" 
-                      class="text-[11px] sm:text-xs bg-slate-800 hover:bg-blue-600 active:bg-blue-700 text-slate-300 hover:text-white px-2 py-1 rounded transition">
-                🔊 Gốc
-              </button>
-            </div>
-          </div>
-          <div id="sub-vi-${index}" class="text-xs sm:text-sm text-emerald-400 font-medium mt-1">${sub.vi}</div>
-        `;
-
-        div.onclick = () => {
-          if (cabinEnabled) {
-            playCabinFromIndex(index);
-          } else {
-            playSegment(sub.start, sub.duration, index);
-          }
-        };
-        container.appendChild(div);
+        div.id = "sub-" + i;
+        div.className = "p-2.5 rounded-lg bg-slate-950/70 border border-slate-800 cursor-pointer";
+        const words = s.text.split(" ").map(w => `<span class="word-span" onclick="lookupWord(event,'${w.replace(/[^a-zA-Z0-9-]/g,"")}',${i})">${w}</span>`).join(" ");
+        div.innerHTML = `<div class="flex justify-between items-start gap-2"><div class="text-sm sm:text-base font-medium leading-relaxed">${words}</div><div class="flex gap-1 shrink-0"><button onclick="event.stopPropagation();playCabinOne(${i})" class="text-xs bg-emerald-600/20 text-emerald-300 px-2 py-1 rounded">🎙️ Cabin</button><button onclick="event.stopPropagation();playSeg(${s.start},${s.duration},${i})" class="text-xs bg-slate-800 text-slate-300 px-2 py-1 rounded">🔊 Gốc</button></div></div><div id="sub-vi-${i}" class="text-xs sm:text-sm text-emerald-400 font-medium mt-1">${s.vi}</div>`;
+        div.onclick = () => playSeg(s.start, s.duration, i);
+        box.appendChild(div);
       });
     }
 
-    function scrollSubtitleContainerOnly(targetEl) {
-      const container = document.getElementById("subtitleList");
-      if (!container || !targetEl) return;
-      const targetTop = targetEl.offsetTop - container.offsetTop - (container.clientHeight / 3);
-      container.scrollTo({
-        top: Math.max(0, targetTop),
-        behavior: "smooth"
-      });
-    }
-
-    function playSegment(start, duration, index) {
-      activeSubIndex = index;
-      stopCabinAudio();
+    function playSeg(start, dur, i) {
+      activeSubIndex = i; stopCabin();
       if (player && player.seekTo) {
-        player.setVolume(100);
-        player.seekTo(start, true);
-        player.playVideo();
+        player.setVolume(100); player.seekTo(start, true); player.playVideo();
         if (activeTimer) clearTimeout(activeTimer);
-        activeTimer = setTimeout(() => {
-          player.pauseVideo();
-        }, (duration + 0.25) * 1000);
+        activeTimer = setTimeout(() => player.pauseVideo(), (dur + 0.25) * 1000);
       }
     }
 
-    function playCabinSingleSentence(index) {
-      const sub = subtitles[index];
-      if (!sub) return;
-      activeSubIndex = index;
-      if (activeTimer) clearTimeout(activeTimer);
-
-      if (player && player.seekTo) {
-        player.setVolume(origDuckVolume);
-        player.seekTo(sub.start, true);
-        player.playVideo();
-      }
-
+    function playCabinOne(i) {
+      const s = subtitles[i]; if (!s) return;
+      activeSubIndex = i; if (activeTimer) clearTimeout(activeTimer);
+      if (player && player.seekTo) { player.setVolume(duckVol); player.seekTo(s.start, true); player.playVideo(); }
       document.getElementById("cabinLiveBar").classList.remove("hidden");
-      speakCabinText(sub.vi, () => {
-        if (!cabinEnabled && player && player.setVolume) {
-          player.setVolume(100);
-        }
-      });
-
-      activeTimer = setTimeout(() => {
-        if (!cabinEnabled && player && player.pauseVideo) {
-          player.pauseVideo();
-          player.setVolume(100);
-        }
-      }, Math.max(sub.duration + 0.8, 3.5) * 1000);
+      speakText(s.vi, () => { if (!cabinEnabled && player) player.setVolume(100); });
+      activeTimer = setTimeout(() => { if (!cabinEnabled && player) { player.pauseVideo(); player.setVolume(100); } }, Math.max(s.duration + 0.8, 3.5) * 1000);
     }
 
-    function playCabinFromIndex(index) {
-      const sub = subtitles[index];
-      if (!sub) return;
-      if (activeTimer) clearTimeout(activeTimer);
-      activeSubIndex = index;
-      lastCabinSpokenIdx = index - 1;
-      stopCabinAudio();
+    function playCurrentSentence() { const s = subtitles[activeSubIndex]; if (s) playSeg(s.start, s.duration, activeSubIndex); }
 
-      if (player && player.seekTo) {
-        player.setVolume(origDuckVolume);
-        player.seekTo(sub.start, true);
-        player.playVideo();
-      }
-      setTimeout(triggerCabinIfNeeded, 150);
-    }
-
-    function playCurrentSentence() {
-      const sub = subtitles[activeSubIndex];
-      if (sub) playSegment(sub.start, sub.duration, activeSubIndex);
-    }
-
-    function playDictMp3() {
-      if (currentDictAudio) {
-        dictAudioPlayer.src = currentDictAudio;
-        dictAudioPlayer.play().catch(() => {});
-      }
-    }
-
-    function closeWordBox() {
-      document.getElementById("wordBox").classList.add("hidden");
-    }
-
-    let lastHighlightIdx = -1;
+    let lastHl = -1;
     setInterval(() => {
       if (!player || !player.getCurrentTime) return;
       const t = player.getCurrentTime();
-      let foundIdx = -1;
-
-      for (let idx = 0; idx < subtitles.length; idx++) {
-        const sub = subtitles[idx];
-        if (t >= sub.start && t <= (sub.start + sub.duration)) {
-          foundIdx = idx;
-          break;
-        }
-      }
-
-      if (foundIdx !== -1 && foundIdx !== lastHighlightIdx) {
-        if (lastHighlightIdx !== -1) {
-          const prevEl = document.getElementById(`sub-${lastHighlightIdx}`);
-          if (prevEl) prevEl.classList.remove("active-sub");
-        }
-        const currEl = document.getElementById(`sub-${foundIdx}`);
-        if (currEl) {
-          currEl.classList.add("active-sub");
-          scrollSubtitleContainerOnly(currEl);
-        }
-
-        if (foundIdx < lastCabinSpokenIdx || foundIdx - lastCabinSpokenIdx > 4) {
-          lastCabinSpokenIdx = foundIdx - 1;
-        }
-
-        activeSubIndex = foundIdx;
-        lastHighlightIdx = foundIdx;
-
-        if (cabinEnabled) {
-          triggerCabinIfNeeded();
-        }
+      const idx = subtitles.findIndex(s => t >= s.start && t <= s.start + s.duration);
+      if (idx !== -1 && idx !== lastHl) {
+        if (lastHl !== -1 && document.getElementById("sub-" + lastHl)) document.getElementById("sub-" + lastHl).classList.remove("active-sub");
+        const el = document.getElementById("sub-" + idx), box = document.getElementById("subtitleList");
+        if (el && box) { el.classList.add("active-sub"); box.scrollTo({top: Math.max(0, el.offsetTop - box.offsetTop - box.clientHeight/3), behavior:"smooth"}); }
+        if (idx < lastSpokenIdx || idx - lastSpokenIdx > 4) lastSpokenIdx = idx - 1;
+        activeSubIndex = idx; lastHl = idx;
+        if (cabinEnabled) triggerCabin();
       }
     }, 200);
 
-    async function lookupWord(event, word, subIndex) {
-      event.stopPropagation();
-      if (!word) return;
-
-      const sub = subtitles[subIndex];
-      playSegment(sub.start, sub.duration, subIndex);
-
-      const box = document.getElementById("wordBox");
-      box.classList.remove("hidden");
+    async function lookupWord(ev, word, idx) {
+      ev.stopPropagation(); if (!word) return;
+      const s = subtitles[idx]; playSeg(s.start, s.duration, idx);
+      document.getElementById("wordBox").classList.remove("hidden");
       document.getElementById("wText").innerText = word;
-      document.getElementById("wIpa").innerText = "Đang tra...";
-      document.getElementById("wPos").innerText = "...";
-      document.getElementById("wMeaning").innerText = "Đang dịch nghĩa...";
-      document.getElementById("wExplain").innerText = "";
+      document.getElementById("wMeaning").innerText = "Đang dịch...";
       document.getElementById("btnDictAudio").classList.add("hidden");
-
-      try {
-        const res = await fetch("/api/lookup-word", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            word: word,
-            context_sentence: sub.text,
-            context_vi: sub.vi
-          })
-        });
-        const data = await res.json();
-
-        document.getElementById("wText").innerText = data.word;
-        document.getElementById("wIpa").innerText = `/${data.ipa}/`;
-        document.getElementById("wPos").innerText = data.pos;
-        document.getElementById("wMeaning").innerText = data.meaning;
-        document.getElementById("wExplain").innerText = data.explanation;
-
-        if (data.audio) {
-          currentDictAudio = data.audio;
-          document.getElementById("btnDictAudio").classList.remove("hidden");
-        }
-      } catch (e) {
-        document.getElementById("wMeaning").innerText = "Lỗi kết nối khi tra từ.";
-      }
+      const r = await fetch("/api/lookup-word", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({word, context_sentence:s.text, context_vi:s.vi})});
+      const d = await r.json();
+      document.getElementById("wText").innerText = d.word;
+      document.getElementById("wIpa").innerText = "/" + d.ipa + "/";
+      document.getElementById("wPos").innerText = d.pos;
+      document.getElementById("wMeaning").innerText = d.meaning;
+      document.getElementById("wExplain").innerText = d.explanation;
+      if (d.audio) { dictAudio.src = d.audio; document.getElementById("btnDictAudio").classList.remove("hidden"); }
     }
   </script>
 </body>
-</html>
-"""
+</html>"""
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_home():
