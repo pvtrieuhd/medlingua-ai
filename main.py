@@ -1,6 +1,7 @@
 import re
 import json
 import time
+import html
 import urllib3
 import requests
 from fastapi import FastAPI, Query
@@ -92,7 +93,7 @@ class WordRequest(BaseModel):
     context_vi: str = ""
 
 def extract_youtube_id(url: str):
-    pattern = r"(?:v=|\/|youtu\.be\/|embed\/)([0-9A-Za-z_-]{11})"
+    pattern = r"(?:v=|\/|youtu\.be\/|embed\/|shorts\/)([0-9A-Za-z_-]{11})"
     match = re.search(pattern, url)
     return match.group(1) if match else None
 
@@ -103,6 +104,252 @@ def safe_request(method: str, url: str, **kwargs):
     except requests.exceptions.SSLError:
         kwargs["verify"] = False
         return session.request(method, url, **kwargs)
+
+def clean_subtitle_text(raw_text: str) -> str:
+    """Làm sạch mã HTML (&amp;, &#39;...) và các thẻ định dạng trong phụ đề."""
+    txt = html.unescape(raw_text or "")
+    txt = re.sub(r"<[^>]+>", " ", txt)
+    txt = txt.replace("\n", " ").strip()
+    return re.sub(r"\s+", " ", txt)
+
+def parse_xml_or_json3_captions(content: str) -> list[dict]:
+    """Giải mã phụ đề định dạng JSON3 hoặc XML của YouTube."""
+    results = []
+    if not content or not content.strip():
+        return results
+
+    # 1. Thử parse định dạng JSON3
+    if content.strip().startswith("{"):
+        try:
+            data = json.loads(content)
+            for ev in data.get("events", []):
+                segs = ev.get("segs", [])
+                if not segs:
+                    continue
+                txt = clean_subtitle_text("".join(s.get("utf8", "") for s in segs))
+                if txt:
+                    start = float(ev.get("tStartMs", 0)) / 1000.0
+                    dur = float(ev.get("dDurationMs", 2500)) / 1000.0
+                    results.append({"text": txt, "start": round(start, 2), "duration": round(dur, 2)})
+            if results:
+                return results
+        except Exception:
+            pass
+
+    # 2. Parse định dạng XML chuẩn (<text start="..." dur="...">)
+    matches = re.findall(r'<text\s+start="([\d\.]+)"(?:\s+dur="([\d\.]+)")?[^>]*>(.*?)</text>', content, flags=re.DOTALL)
+    for start_s, dur_s, raw_t in matches:
+        txt = clean_subtitle_text(raw_t)
+        if txt:
+            start = float(start_s)
+            dur = float(dur_s) if dur_s else 2.5
+            results.append({"text": txt, "start": round(start, 2), "duration": round(dur, 2)})
+    if results:
+        return results
+
+    # 3. Parse định dạng XML srv3 (<p t="..." d="...">)
+    p_matches = re.findall(r'<p\s+t="(\d+)"(?:\s+d="(\d+)")?[^>]*>(.*?)</p>', content, flags=re.DOTALL)
+    for t_ms, d_ms, raw_t in p_matches:
+        txt = clean_subtitle_text(raw_t)
+        if txt:
+            start = float(t_ms) / 1000.0
+            dur = float(d_ms) / 1000.0 if d_ms else 2.5
+            results.append({"text": txt, "start": round(start, 2), "duration": round(dur, 2)})
+
+    return results
+
+def parse_vtt_time(ts: str) -> float:
+    parts = ts.strip().replace(",", ".").split(":")
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    elif len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    return 0.0
+
+def parse_webvtt_captions(vtt_text: str) -> list[dict]:
+    """Giải mã phụ đề định dạng WebVTT từ Piped / Invidious."""
+    results = []
+    blocks = re.split(r"\n\s*\n", vtt_text.replace("\r\n", "\n"))
+    for block in blocks:
+        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+        time_line_idx = -1
+        for idx, line in enumerate(lines):
+            if "-->" in line:
+                time_line_idx = idx
+                break
+        if time_line_idx == -1:
+            continue
+        time_parts = lines[time_line_idx].split("-->")
+        start_sec = parse_vtt_time(time_parts[0])
+        end_sec = parse_vtt_time(time_parts[1].split()[0])
+        dur_sec = max(round(end_sec - start_sec, 2), 1.2)
+        txt = clean_subtitle_text(" ".join(lines[time_line_idx + 1:]))
+        if txt and (not results or results[-1]["text"] != txt):
+            results.append({"text": txt, "start": round(start_sec, 2), "duration": dur_sec})
+    return results
+
+def fetch_youtube_subtitles(video_id: str) -> list[dict]:
+    """
+    Hệ thống lấy phụ đề 5 tầng chống chặn IP Cloud (Render / AWS / GCP).
+    """
+    errors = []
+
+    # TẦNG 1: Tactiq Transcript Cloud API (Hoạt động cực tốt trên IP Cloud Render)
+    for lang_code in ["en", "en-US", "en-GB"]:
+        try:
+            r = safe_request(
+                "POST",
+                "https://tactiq-apps-prod.tactiq.io/transcript",
+                json={"videoUrl": f"https://www.youtube.com/watch?v={video_id}", "langCode": lang_code},
+                headers={"Content-Type": "application/json", "User-Agent": HEADERS["User-Agent"]},
+                timeout=8
+            )
+            if r.status_code == 200:
+                data = r.json()
+                captions = data.get("captions", [])
+                if captions:
+                    subs = []
+                    for c in captions:
+                        txt = clean_subtitle_text(c.get("text", ""))
+                        if txt:
+                            subs.append({
+                                "text": txt,
+                                "start": round(float(c.get("start", 0)), 2),
+                                "duration": round(float(c.get("dur", 2.5)), 2)
+                            })
+                    if subs:
+                        return subs
+        except Exception as e:
+            errors.append(f"Tactiq: {e}")
+
+    # TẦNG 2: YouTubeTranscript Proxy Server
+    try:
+        r = safe_request("GET", f"https://youtubetranscript.com/?server_vid2={video_id}", timeout=8)
+        if r.status_code == 200 and "<text" in r.text and "<error>" not in r.text:
+            subs = parse_xml_or_json3_captions(r.text)
+            if subs:
+                return subs
+    except Exception as e:
+        errors.append(f"YTTranscriptProxy: {e}")
+
+    # TẦNG 3: YouTube InnerTube Mobile API (Giả lập client ANDROID_VR & IOS)
+    innertube_clients = [
+        {
+            "client": {
+                "clientName": "ANDROID_VR",
+                "clientVersion": "1.60.19",
+                "androidSdkVersion": 34,
+                "userAgent": "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 14; en_US; Quest 3; Build/UP1A.231005.007.A1; Cronet/132.0.6808.3)",
+                "hl": "en",
+                "gl": "US"
+            }
+        },
+        {
+            "client": {
+                "clientName": "IOS",
+                "clientVersion": "19.45.4",
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone16,2",
+                "userAgent": "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1_0 like Mac OS X;)",
+                "hl": "en",
+                "gl": "US"
+            }
+        }
+    ]
+    for ctx in innertube_clients:
+        try:
+            r = safe_request(
+                "POST",
+                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                json={"videoId": video_id, "context": ctx},
+                headers={"Content-Type": "application/json", "User-Agent": ctx["client"]["userAgent"]},
+                timeout=7
+            )
+            if r.status_code == 200:
+                p_data = r.json()
+                tracks = (
+                    p_data.get("captions", {})
+                    .get("playerCaptionsTracklistRenderer", {})
+                    .get("captionTracks", [])
+                )
+                if tracks:
+                    chosen_track = tracks[0]
+                    for tr in tracks:
+                        if tr.get("languageCode", "").startswith("en"):
+                            chosen_track = tr
+                            break
+                    base_url = chosen_track.get("baseUrl", "")
+                    if base_url:
+                        sub_r = safe_request("GET", base_url + "&fmt=json3", timeout=7)
+                        subs = parse_xml_or_json3_captions(sub_r.text)
+                        if not subs:
+                            sub_r2 = safe_request("GET", base_url, timeout=7)
+                            subs = parse_xml_or_json3_captions(sub_r2.text)
+                        if subs:
+                            return subs
+        except Exception as e:
+            errors.append(f"InnerTube: {e}")
+
+    # TẦNG 4: Hệ thống Piped & Invidious Cloud APIs
+    piped_instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.leptons.xyz",
+        "https://api.piped.private.coffee"
+    ]
+    for instance in piped_instances:
+        try:
+            r = safe_request("GET", f"{instance}/streams/{video_id}", timeout=6)
+            if r.status_code == 200:
+                subtitles_list = r.json().get("subtitles", [])
+                if subtitles_list:
+                    chosen = subtitles_list[0]
+                    for s in subtitles_list:
+                        if s.get("code", "").startswith("en"):
+                            chosen = s
+                            break
+                    sub_url = chosen.get("url")
+                    if sub_url:
+                        sr = safe_request("GET", sub_url, timeout=6)
+                        subs = parse_webvtt_captions(sr.text) if "WEBVTT" in sr.text[:30] else parse_xml_or_json3_captions(sr.text)
+                        if subs:
+                            return subs
+        except Exception as e:
+            errors.append(f"Piped({instance}): {e}")
+
+    invidious_instances = [
+        "https://inv.nadeko.net",
+        "https://invidious.nerdvpn.de",
+        "https://yewtu.be"
+    ]
+    for inv in invidious_instances:
+        try:
+            r = safe_request("GET", f"{inv}/api/v1/captions/{video_id}", timeout=6)
+            if r.status_code == 200:
+                caps = r.json().get("captions", [])
+                if caps:
+                    chosen_label = caps[0].get("label", "")
+                    for c in caps:
+                        if c.get("language_code", "").startswith("en"):
+                            chosen_label = c.get("label", "")
+                            break
+                    if chosen_label:
+                        vtt_r = safe_request("GET", f"{inv}/api/v1/captions/{video_id}", params={"label": chosen_label}, timeout=6)
+                        subs = parse_webvtt_captions(vtt_r.text)
+                        if subs:
+                            return subs
+        except Exception as e:
+            errors.append(f"Invidious({inv}): {e}")
+
+    # TẦNG 5: Thư viện youtube-transcript-api mặc định
+    langs = ['en', 'en-US', 'en-GB']
+    if hasattr(YouTubeTranscriptApi, "get_transcript"):
+        return YouTubeTranscriptApi.get_transcript(video_id, languages=langs)
+    else:
+        api = YouTubeTranscriptApi()
+        fetched = api.fetch(video_id, languages=langs)
+        return [{"text": s.text, "start": s.start, "duration": s.duration} for s in fetched]
 
 def clean_spoken_fillers(text: str) -> str:
     """Loại bỏ các từ đệm 'uh', 'um', 'er' trong hội nghị để dịch tiếng Việt tự nhiên hơn."""
@@ -221,15 +468,6 @@ def translate_list_in_batches(texts: list[str], batch_size: int = 35) -> list[st
             time.sleep(0.1)
     return all_translated
 
-def fetch_youtube_subtitles(video_id: str):
-    langs = ['en', 'en-US', 'en-GB']
-    if hasattr(YouTubeTranscriptApi, "get_transcript"):
-        return YouTubeTranscriptApi.get_transcript(video_id, languages=langs)
-    else:
-        api = YouTubeTranscriptApi()
-        fetched = api.fetch(video_id, languages=langs)
-        return [{"text": s.text, "start": s.start, "duration": s.duration} for s in fetched]
-
 @app.get("/api/tts")
 async def text_to_speech(text: str = Query(..., max_length=500)):
     """API tạo giọng đọc Thuyết minh Cabin Tiếng Việt mượt mà từ Google TTS."""
@@ -293,7 +531,7 @@ async def process_video(req: VideoRequest):
 
         return {"video_id": video_id, "subtitles": subtitles}
     except Exception as e:
-        return {"error": f"Không thể lấy phụ đề video này. Chi tiết: {str(e)}"}
+        return {"error": f"Video này không có phụ đề tiếng Anh hoặc tạm thời bị giới hạn. Chi tiết: {str(e)}"}
 
 @app.post("/api/translate-batch")
 async def api_translate_batch(req: BatchTranslateRequest):
@@ -443,7 +681,7 @@ HTML_CONTENT = """
 <body class="bg-slate-950 text-slate-100 min-h-screen pb-6 lg:p-6">
   <div class="max-w-7xl mx-auto">
 
-    <!-- HEADER & Ô DÁN LINK (Gọn gàng trên điện thoại) -->
+    <!-- HEADER & Ô DÁN LINK -->
     <div class="p-3 sm:p-4 lg:p-0">
       <header class="border-b border-slate-800 pb-3 mb-3 flex flex-wrap justify-between items-center gap-2">
         <div>
@@ -471,10 +709,10 @@ HTML_CONTENT = """
       </div>
     </div>
 
-    <!-- BỐ CỤC CHÍNH: GHIM VIDEO TRÊN ĐIỆN THOẠI + CHIA CỘT TRÊN MÁY TÍNH -->
+    <!-- BỐ CỤC CHÍNH -->
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-3 lg:gap-6 px-2 sm:px-4 lg:px-0">
 
-      <!-- CỘT TRÁI: VIDEO + DỊCH CABIN (Sticky trên Mobile để lướt phụ đề vẫn thấy Video) -->
+      <!-- CỘT TRÁI: VIDEO + DỊCH CABIN -->
       <div class="lg:col-span-2 space-y-2.5 sm:space-y-4 sticky top-0 z-30 bg-slate-950 pt-1 pb-2 lg:static lg:p-0">
         <div class="aspect-video bg-black rounded-xl overflow-hidden border border-slate-800 shadow-2xl relative">
           <div id="player" class="w-full h-full"></div>
@@ -510,7 +748,6 @@ HTML_CONTENT = """
             </div>
           </div>
 
-          <!-- Thanh trạng thái đọc Cabin -->
           <div id="cabinLiveBar" class="hidden mt-2 pt-2 border-t border-slate-800/80 flex items-center gap-2 text-xs sm:text-sm">
             <span class="text-[10px] sm:text-xs bg-emerald-500/20 text-emerald-300 px-2 py-0.5 rounded font-semibold shrink-0 animate-pulse">
               🎙️ Cabin
@@ -519,7 +756,7 @@ HTML_CONTENT = """
           </div>
         </div>
 
-        <!-- HỘP TRA TỪ ĐIỂN Y KHOA (Trên điện thoại biến thành Bottom Drawer trượt lên; Trên PC nằm cố định) -->
+        <!-- HỘP TRA TỪ ĐIỂN Y KHOA -->
         <div id="wordBox" class="hidden fixed bottom-0 left-0 right-0 z-50 p-4 rounded-t-2xl bg-slate-900/95 backdrop-blur-md border-t-2 border-blue-500 shadow-[0_-10px_30px_rgba(0,0,0,0.8)] lg:static lg:z-auto lg:p-5 lg:rounded-xl lg:border lg:border-slate-800 lg:shadow-xl">
           <div class="flex items-start justify-between gap-2 border-b border-slate-800 pb-2.5 mb-2.5">
             <div>
@@ -575,7 +812,6 @@ HTML_CONTENT = """
     let currentDictAudio = "";
     let translationJobId = 0;
 
-    // Dùng 1 đối tượng Audio duy nhất để tương thích chính sách Autoplay của iOS Safari & Android Chrome
     let cabinEnabled = false;
     const cabinAudio = new Audio();
     cabinAudio.playsInline = true;
@@ -643,7 +879,6 @@ HTML_CONTENT = """
     }
 
     function unlockMobileAudio() {
-      // Mở khóa quyền phát âm thanh trên iPhone/Android ngay khi người dùng chạm nút
       cabinAudio.src = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA";
       cabinAudio.play().then(() => {
         cabinAudio.pause();
@@ -932,7 +1167,6 @@ HTML_CONTENT = """
     }
 
     function scrollSubtitleContainerOnly(targetEl) {
-      // Cuộn mượt bên trong khung phụ đề mà KHÔNG làm nhảy trang trên điện thoại
       const container = document.getElementById("subtitleList");
       if (!container || !targetEl) return;
       const targetTop = targetEl.offsetTop - container.offsetTop - (container.clientHeight / 3);
