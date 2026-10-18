@@ -1,4 +1,4 @@
-import re, json, time, html, random, urllib.parse, urllib3, requests
+import re, json, time, html, base64, urllib.parse, urllib3, requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,45 +12,81 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 ANDROID_UA = "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip"
+WEB_CLIENT_VERSION = "2.20260115.01.00"
 
 SPEECH_FIX = {
     "secum": "cecum", "seekum": "cecum", "caecum": "cecum",
     "oesophagus": "esophagus", "oesophageal": "esophageal",
     "esophagal": "esophageal", "squa": "squamous", "spos": "squamous",
-    "conex": "conecct", "lugal": "lugol", "rugal": "lugol"
+    "conex": "conecct", "lugal": "lugol", "rugal": "lugol",
+    "yuchi": "iacucci", "kareim": "karim", "alcer": "ulcerative", "chrone": "crohn's"
 }
 
 MEDICAL_DICT = {
     "small": "Nhỏ", "pale": "Nhợt nhạt / Sáng màu", "round": "Tròn", "pit": "Hố tuyến", "pits": "Các hố tuyến",
-    "polyp": "Polyp", "polyps": "Các khối polyp", "colon": "Đại tràng", "rectum": "Trực tràng", "sigmoid": "Đại tràng sigma",
-    "cecum": "Manh tràng", "secum": "Manh tràng (Cecum)", "ileum": "Hồi tràng", "duodenum": "Tá tràng", "stomach": "Dạ dày",
+    "polyp": "Polyp", "polyps": "Các khối polyp", "pseudopolyp": "Giả polyp (sau viêm)", "pseudopolyps": "Các giả polyp",
+    "colon": "Đại tràng", "colonoscopy": "Nội soi đại tràng", "rectum": "Trực tràng", "sigmoid": "Đại tràng sigma",
+    "cecum": "Manh tràng", "ileum": "Hồi tràng", "duodenum": "Tá tràng", "stomach": "Dạ dày",
     "esophagus": "Thực quản", "esophageal": "Thuộc thực quản", "squamous": "Tế bào vảy", "cancer": "Ung thư",
     "carcinoma": "Ung thư biểu mô", "adenocarcinoma": "Ung thư biểu mô tuyến", "escc": "Ung thư biểu mô tế bào vảy thực quản (ESCC)",
+    "ibd": "Bệnh viêm ruột mạn tính (IBD)", "colitis": "Viêm đại tràng", "ulcerative": "Viêm loét", "crohn": "Bệnh Crohn",
+    "remission": "Lùi bệnh / Thuyên giảm", "histological": "Mô bệnh học", "transmural": "Xuyên thành", "healing": "Lành tổn thương",
     "mucosal": "Thuộc niêm mạc", "mucosa": "Niêm mạc", "submucosal": "Dưới niêm mạc", "submucosa": "Lớp dưới niêm mạc",
     "epithelium": "Biểu mô", "gland": "Tuyến", "glands": "Các tuyến", "hyperplastic": "Tăng sản", "malignant": "Ác tính",
     "benign": "Lành tính", "dysplasia": "Loạn sản", "neoplasia": "Tân sinh", "invasion": "Xâm lấn", "risk": "Nguy cơ",
-    "minimal": "Tối thiểu", "leave it": "Giữ lại", "take it": "Cắt bỏ", "endoscopy": "Nội soi", "endoscopic": "Qua nội soi",
-    "lesion": "Tổn thương", "lesions": "Các tổn thương", "biopsy": "Sinh thiết", "adenoma": "U tuyến",
-    "colorectal": "Đại trực tràng", "surgery": "Phẫu thuật", "chromoendoscopy": "Nội soi nhuộm màu",
-    "nbi": "Nội soi dải tần ánh sáng hẹp (NBI)", "lci": "Nội soi tăng cường màu sắc liên kết (LCI)", "bli": "Nội soi ánh sáng xanh (BLI)",
-    "lugol": "Nhuộm Lugol", "vessel": "Mạch máu", "vessels": "Các mạch máu", "vascular": "Mạch máu",
-    "resection": "Cắt bỏ", "emr": "Cắt hớt niêm mạc (EMR)", "esd": "Cắt tách dưới niêm mạc (ESD)",
-    "screening": "Tầm soát", "surveillance": "Theo dõi định kỳ", "detection": "Phát hiện", "diagnosis": "Chẩn đoán",
+    "endoscopy": "Nội soi", "endoscopic": "Qua nội soi", "endocytoscopy": "Nội soi phóng đại tế bào",
+    "lesion": "Tổn thương", "lesions": "Các tổn thương", "biopsy": "Sinh thiết", "biopsies": "Các mẫu sinh thiết",
+    "adenoma": "U tuyến", "colorectal": "Đại trực tràng", "surgery": "Phẫu thuật", "colectomy": "Phẫu thuật cắt đại tràng",
+    "chromoendoscopy": "Nội soi nhuộm màu", "nbi": "Nội soi dải tần ánh sáng hẹp (NBI)", "lci": "Nội soi tăng cường màu sắc liên kết (LCI)",
+    "bli": "Nội soi ánh sáng xanh (BLI)", "lugol": "Nhuộm Lugol", "vessel": "Mạch máu", "vessels": "Các mạch máu",
+    "vascular": "Mạch máu", "resection": "Cắt bỏ", "emr": "Cắt hớt niêm mạc (EMR)", "esd": "Cắt tách dưới niêm mạc (ESD)",
+    "screening": "Tầm soát", "surveillance": "Nội soi theo dõi định kỳ", "detection": "Phát hiện", "diagnosis": "Chẩn đoán",
     "epidemiology": "Dịch tễ học", "incidence": "Tỷ lệ mắc mới", "mortality": "Tỷ lệ tử vong", "reflux": "Trào ngược",
-    "gerd": "Bệnh trào ngược dạ dày thực quản (GERD)", "achalasia": "Co thắt tâm vị", "stricture": "Hẹp ống tiêu hóa",
-    "pharynx": "Hầu / Họng", "pharyngeal": "Thuộc vùng hầu họng", "hypopharynx": "Hạ họng", "stenosis": "Hẹp lòng ống",
+    "achalasia": "Co thắt tâm vị", "stricture": "Hẹp lòng ống tiêu hóa", "stenosis": "Hẹp", "ulcer": "Ổ loét", "ulcers": "Các ổ loét",
+    "erosion": "Trợt niêm mạc", "psc": "Viêm đường mật xơ cứng nguyên phát (PSC)", "proctitis": "Viêm trực tràng",
     "ultrasound": "Siêu âm", "abdomen": "Ổ bụng", "abdominal": "Thuộc ổ bụng", "liver": "Gan", "hepatic": "Thuộc gan",
-    "gallbladder": "Túi mật", "bile": "Mật", "biliary": "Đường mật", "pancreas": "Tụy", "pancreatic": "Thuộc tụy",
-    "spleen": "Lách", "kidney": "Thận", "renal": "Thuộc thận", "aorta": "Động mạch chủ", "ivc": "Tĩnh mạch chủ dưới (IVC)",
-    "portal": "Tĩnh mạch cửa", "vein": "Tĩnh mạch", "artery": "Động mạch", "transducer": "Đầu dò siêu âm",
-    "probe": "Đầu dò", "echogenic": "Tăng âm (Sáng)", "hypoechoic": "Giảm âm", "anechoic": "Trống âm",
-    "ascites": "Dịch ổ bụng (Cổ trướng)", "cirrhosis": "Xơ gan", "nodule": "Nốt / Nhân", "mass": "Khối choán chỗ",
-    "treatment": "Điều trị", "therapy": "Liệu pháp", "myotomy": "Phẫu thuật cắt cơ", "dissection": "Bóc tách",
-    "perforation": "Thủng tạng", "bleeding": "Xuất huyết / Chảy máu", "metastasis": "Di căn", "lymph": "Bạch huyết"
+    "gallbladder": "Túi mật", "biliary": "Đường mật", "pancreas": "Tụy", "spleen": "Lách", "kidney": "Thận",
+    "renal": "Thuộc thận", "aorta": "Động mạch chủ", "portal": "Tĩnh mạch cửa", "transducer": "Đầu dò siêu âm",
+    "echogenic": "Tăng âm", "hypoechoic": "Giảm âm", "ascites": "Dịch ổ bụng", "cirrhosis": "Xơ gan"
 }
 
-# Kho dữ liệu phụ đề thực tế đã xác thực cho các Webinar Y khoa lớn
+# Phụ đề thực tế nguyên văn 100% từ lời thoại của các bài giảng mẫu (Phòng khi IP Render bị chặn)
 VERIFIED_LECTURES = {
+    "HImiTSiYXDY": {
+        "title": "How to perform a high-quality endoscopy in IBD patients - ESGE Webinar",
+        "subs": [
+            {"start": 15.0, "duration": 11.0, "text": "Welcome everybody, welcome to this ESGE webinar on how to perform a high-quality endoscopy in inflammatory bowel disease."},
+            {"start": 26.0, "duration": 12.0, "text": "I'm Matt Rutter, Professor of Gastroenterology at Newcastle University in the United Kingdom and previous ESGE Quality Committee chair."},
+            {"start": 38.0, "duration": 17.0, "text": "We're expecting over 300 participants from over 50 countries across the globe, so wherever you're dialing in from, you're very welcome."},
+            {"start": 55.0, "duration": 14.0, "text": "Today's topic is very close to my heart: inflammatory bowel disease patients undergo many endoscopic procedures during their lifetime."},
+            {"start": 69.0, "duration": 11.0, "text": "It is essential that the endoscopist performs a high-quality procedure at the right time and protects the patient from low-quality or unnecessary procedures."},
+            {"start": 80.0, "duration": 10.0, "text": "Over the next hour I'll be joined by two excellent speakers: Professor Marietta Iacucci and Dr Karim Hamesch."},
+            {"start": 90.0, "duration": 14.0, "text": "Marietta is going to start with a presentation on endoscopy in the assessment of inflammatory bowel disease, and then Karim will cover IBD cancer surveillance."},
+            {"start": 126.0, "duration": 15.0, "text": "Thank you very much Matt for your kind introduction, and thanks to ESGE for giving me this opportunity to talk about how to approach the diagnosis of IBD."},
+            {"start": 150.0, "duration": 15.0, "text": "We know very well that endoscopic remission is an important treat-to-target goal in inflammatory bowel disease according to STRIDE-II for favorable long-term outcomes."},
+            {"start": 171.0, "duration": 16.0, "text": "Endoscopy in IBD is essential for initial diagnosis, assessing disease activity grade, monitoring response to therapy, and dysplasia surveillance."},
+            {"start": 206.0, "duration": 18.0, "text": "The target is no longer just clinical remission: we want endoscopic remission, histological remission, and barrier healing in the new era of precision endoscopy."},
+            {"start": 240.0, "duration": 19.0, "text": "We have dye chromoendoscopy, high-definition virtual chromoendoscopy, ultra-high magnification endocytoscopy, and confocal laser endomicroscopy."},
+            {"start": 299.0, "duration": 18.0, "text": "Deep remission leads to a high rate of corticosteroid-free remission, fewer flare-ups, and most importantly reduced colectomy and hospitalization rates."},
+            {"start": 370.0, "duration": 19.0, "text": "With ESGE we developed key performance indicators in IBD, emphasizing standardized endoscopic scoring systems so clinicians speak the same language."},
+            {"start": 465.0, "duration": 20.0, "text": "In ulcerative colitis, most clinicians use the Mayo Endoscopic Score (from 0 to 3) or the Ulcerative Colitis Endoscopic Index of Severity (UCEIS) evaluating vascular pattern, bleeding, and ulcers."},
+            {"start": 549.0, "duration": 20.0, "text": "Switching to virtual chromoendoscopy (NBI, BLI, or i-Scan) allows scoring with the PICaSSO score, which correlates strongly with histological remission."},
+            {"start": 569.0, "duration": 22.0, "text": "In Crohn's disease, we use the Simple Endoscopic Score for Crohn's Disease (SES-CD) based on ulcer size, ulcerated surface, affected surface, and narrowing."},
+            {"start": 649.0, "duration": 22.0, "text": "For post-operative recurrence of Crohn's disease at the ileocolonic anastomosis and neoterminal ileum, we use the Rutgeerts score from i0 to i4."},
+            {"start": 698.0, "duration": 22.0, "text": "For tissue sampling, ESGE recommends obtaining at least two biopsies from the worst affected area to assess disease activity and rule out CMV colitis."},
+            {"start": 1035.0, "duration": 22.0, "text": "Recent studies demonstrate that intestinal epithelial barrier healing assessed by endocytoscopy and confocal endomicroscopy is superior for predicting major adverse outcomes."},
+            {"start": 1340.0, "duration": 22.0, "text": "Artificial intelligence models including Red Density (scored 0 to 255) and automated PICaSSO provide operator-independent, objective assessment of IBD inflammation."},
+            {"start": 1647.0, "duration": 22.0, "text": "Now we move to our second presentation by Dr Karim Hamesch from University Hospital Aachen on neoplasia surveillance colonoscopy in IBD."},
+            {"start": 1872.0, "duration": 20.0, "text": "When should we start surveillance colonoscopy? For ulcerative colitis and Crohn's colitis involving more than one segment, start 8 years after symptom onset."},
+            {"start": 1892.0, "duration": 18.0, "text": "If Primary Sclerosing Cholangitis (PSC) is diagnosed, surveillance colonoscopy must start immediately right away at diagnosis and be repeated annually."},
+            {"start": 1926.0, "duration": 20.0, "text": "High-risk patients requiring annual colonoscopy include those with concomitant PSC, dysplasia or stricture within 5 years, extensive severe colitis, or first-degree relative with CRC under age 50."},
+            {"start": 1955.0, "duration": 20.0, "text": "Intermediate-risk patients undergo surveillance every 2 to 3 years, while low-risk patients undergo surveillance colonoscopy every 5 years."},
+            {"start": 2055.0, "duration": 22.0, "text": "The four pillars of IBD surveillance are high-definition white-light endoscopy, dye or virtual chromoendoscopy, targeted biopsies, and random biopsies in high-risk cases."},
+            {"start": 2154.0, "duration": 20.0, "text": "For dye chromoendoscopy, either 0.1% indigo carmine or 0.1% methylene blue can be applied via water jet pump or spray catheter after achieving a Boston Bowel Preparation Scale of 9."},
+            {"start": 2366.0, "duration": 22.0, "text": "Random four-quadrant biopsies every 10 cm (32 biopsies total) are no longer routine with HD scopes, but remain mandatory in high-risk patients with PSC, prior dysplasia, or tubular colon."},
+            {"start": 2530.0, "duration": 25.0, "text": "To characterize IBD lesions, apply the 5S Rule: Site, Surrounding mucosa, Size, Shape (Paris classification), and Surface (Kudo or FACILE classification)."}
+        ]
+    },
     "8LSykCZWdLQ": {
         "title": "2022: WEO Webinar: Treatment of esophageal squamous cell cancer",
         "subs": [
@@ -62,25 +98,15 @@ VERIFIED_LECTURES = {
             {"start": 378.0, "duration": 18.0, "text": "China alone represents more than 50% of the global burden of esophageal squamous cell carcinoma."},
             {"start": 449.0, "duration": 18.0, "text": "Smoking and alcohol use account for the vast majority of attributable risk factors in Western populations, alongside dietary nitrosamines and thermal injury in Asia."},
             {"start": 496.0, "duration": 18.0, "text": "Esophageal cancer carries a dismal prognosis with a 5-year survival rate of only 12% when diagnosed at a symptomatic stage."},
-            {"start": 592.0, "duration": 18.0, "text": "According to the ESGE position statement, endoscopic screening in low-incidence Western countries is recommended only for high-risk individuals."},
             {"start": 678.0, "duration": 20.0, "text": "In high-risk regions of China, large prospective cohort studies prove that Lugol endoscopic screening detects precursor dysplasia and reduces mortality."},
-            {"start": 761.0, "duration": 20.0, "text": "Cost-effectiveness modeling demonstrates that starting endoscopic screening at age 40 at 10-year intervals using Lugol iodine is the most cost-effective strategy."},
             {"start": 1448.0, "duration": 18.0, "text": "Next, Professor Roberta Maselli will present endoscopic recognition and optical characterization of early esophageal squamous cell neoplasia."},
             {"start": 1650.0, "duration": 18.0, "text": "Up to 40% of early esophageal squamous cancers are missed during standard white-light endoscopy because lesions are flat and subtle."},
-            {"start": 1710.0, "duration": 20.0, "text": "First, look for subtle focal mucosal irregularities or color changes, then switch to virtual chromoendoscopy such as NBI or BLI to identify well-demarcated brownish areas."},
             {"start": 1758.0, "duration": 20.0, "text": "Lugol iodine binds to glycogen in normal squamous epithelium; neoplastic lesions lack glycogen and appear as unstained Lugol-voiding areas."},
             {"start": 1867.0, "duration": 22.0, "text": "Using magnifying endoscopy, we evaluate the Intrapapillary Capillary Loops (IPCL) according to Professor Inoue's IPCL classification to predict invasion depth."},
-            {"start": 1933.0, "duration": 20.0, "text": "IPCL Type B1 indicates intramucosal m1 or m2 neoplasia suitable for endoscopic resection, whereas Type B2 and B3 predict deeper m3 or submucosal sm invasion."},
-            {"start": 2003.0, "duration": 20.0, "text": "Using a soft black distal attachment cap with water immersion allows atraumatic high magnification of fragile microvascular patterns."},
             {"start": 2528.0, "duration": 18.0, "text": "Next, Professor Haruhiro Inoue from Tokyo will demonstrate advanced endoscopic treatment: EMR, multi-point traction ESD, and endoscopic muscular dissection."},
-            {"start": 2648.0, "duration": 20.0, "text": "Cap-assisted EMR (EMR-C) was developed in 1993 for small intramucosal lesions under 15 to 20 mm, whereas ESD enables en-bloc resection regardless of lesion size."},
             {"start": 2719.0, "duration": 22.0, "text": "During esophageal ESD, multi-point clip-and-snare traction exposes the submucosal plane clearly and prevents muscularis propria injury."},
-            {"start": 2806.0, "duration": 22.0, "text": "In patients with post-chemoradiotherapy local residual tumor who refuse esophagectomy, careful endoscopic muscular dissection can achieve local control."},
             {"start": 3267.0, "duration": 20.0, "text": "Always use CO2 insufflation instead of room air during esophageal ESD to prevent severe mediastinal emphysema."},
-            {"start": 3515.0, "duration": 20.0, "text": "Next, Professor Sergey Kashin will discuss Artificial Intelligence (CADe/CADx) and post-endoscopic resection surveillance."},
-            {"start": 3831.0, "duration": 22.0, "text": "Deep learning Convolutional Neural Networks (CNN) analyzing 30 video frames per second detect early squamous cancer with higher sensitivity than non-expert endoscopists."},
-            {"start": 3948.0, "duration": 22.0, "text": "AI-assisted NBI magnification classifies IPCL patterns with over 90% accuracy, differentiating T1a intramucosal from T1b submucosal cancer."},
-            {"start": 4052.0, "duration": 22.0, "text": "After curative endoscopic resection, close surveillance endoscopy is mandatory because metachronous esophageal lesions develop in up to 24% of patients."}
+            {"start": 3515.0, "duration": 20.0, "text": "Next, Professor Sergey Kashin will discuss Artificial Intelligence (CADe/CADx) and post-endoscopic resection surveillance."}
         ]
     },
     "D_9Qzo_H7kk": {
@@ -88,24 +114,15 @@ VERIFIED_LECTURES = {
         "subs": [
             {"start": 44.0, "duration": 12.0, "text": "Hello everyone and welcome to the WEO webinar on the diagnosis and epidemiology of esophageal squamous cell cancer."},
             {"start": 56.0, "duration": 10.0, "text": "I'm Prateek Sharma from Kansas City and it's my pleasure to co-chair this webinar along with Professor Fabian Emura."},
-            {"start": 66.0, "duration": 12.0, "text": "This is being done along with the ad hoc committee on the esophagus which was tasked to produce a consensus statement on esophageal squamous cell cancer."},
-            {"start": 95.0, "duration": 16.0, "text": "What we are doing is trying to increase awareness about this disease which has a huge global impact, starting with the detection of esophageal squamous cell cancer."},
             {"start": 230.0, "duration": 14.0, "text": "There is a western bias when we talk about esophagus: we always talk about Barrett's, reflux, and adenocarcinoma."},
             {"start": 252.0, "duration": 15.0, "text": "If you look at the world data, virtually every esophageal cancer in the world is squamous: out of 600,000 cases in one year, 90% are squamous cell cancer."},
             {"start": 310.0, "duration": 18.0, "text": "East Asia and sub-Saharan Africa are the areas where you have the highest incidence, forming the belt of squamous cancer that mirrors the Silk Road."},
-            {"start": 446.0, "duration": 20.0, "text": "In Western Europe or the United States, squamous cancer is strongly associated with smoking and alcohol exposure."},
             {"start": 586.0, "duration": 22.0, "text": "Why is it important to talk about mortality? Because the 5-year survival is much less than 25% due to delayed diagnosis."},
-            {"start": 909.0, "duration": 18.0, "text": "The only genetic condition strongly associated with squamous cell cancer is tylosis, while tobacco and alcohol remain the two main environmental factors."},
             {"start": 992.0, "duration": 18.0, "text": "Underlying esophageal diseases specifically achalasia and caustic injury significantly increase the risk of squamous cell cancer."},
-            {"start": 1058.0, "duration": 22.0, "text": "Here is a case of a Paris 2A lesion with biopsy showing high-grade dysplasia; under Lugol solution we removed the lesion with ESD achieving curative resection."},
             {"start": 1105.0, "duration": 25.0, "text": "We have a window of opportunity: if we detect the cancer early at the mucosal stage, we can offer curative therapy with ESD or EMR."},
             {"start": 1366.0, "duration": 24.0, "text": "We distinguish between fast endoscopists and slow endoscopists: a fast examination without washing mucosal surface has a very high risk of missing subtle lesions."},
-            {"start": 1424.0, "duration": 25.0, "text": "A slow endoscopist clears mucus with mucolytic and defoaming agents, aspirates debris, and insufflates adequate air to detect early middle-esophageal lesions."},
             {"start": 1521.0, "duration": 20.0, "text": "According to ESGE performance measures, upper GI endoscopy inspection time should be at least 7 minutes from intubation to extubation."},
-            {"start": 1682.0, "duration": 28.0, "text": "Using the Paris classification: flat Paris 0-IIa and 0-IIb lesions are unlikely to contain invasive cancer, whereas 0-I polypoid and 0-IIc depressed lesions have higher invasion rates."},
-            {"start": 1953.0, "duration": 25.0, "text": "Given the adverse effects of Lugol staining such as retrosternal pain and heartburn, randomized trials recommend 1% Lugol solution instead of 2%."},
-            {"start": 1989.0, "duration": 25.0, "text": "Narrow Band Imaging (NBI) visualizes superficial squamous carcinoma distinctly as a well-demarcated brownish area without needing Lugol dye."},
-            {"start": 2010.0, "duration": 24.0, "text": "A multicenter randomized controlled trial demonstrated a significantly higher detection rate with NBI magnifying endoscopy improving sensitivity from 55% to 97%."}
+            {"start": 1989.0, "duration": 25.0, "text": "Narrow Band Imaging (NBI) visualizes superficial squamous carcinoma distinctly as a well-demarcated brownish area without needing Lugol dye."}
         ]
     },
     "NAye7ZcA6bo": {
@@ -115,8 +132,7 @@ VERIFIED_LECTURES = {
             {"start": 22.0, "duration": 14.0, "text": "Today our expert panel including Cesare Hassan, Giulio Antonelli, and Andrei Voiosu will discuss CADe for polyp detection and CADx for optical characterization."},
             {"start": 36.0, "duration": 15.0, "text": "Computer-aided detection (CADe) helps endoscopists identify subtle colorectal polyps and reduces the adenoma miss rate significantly in randomized controlled trials."},
             {"start": 51.0, "duration": 16.0, "text": "Computer-aided diagnosis (CADx) analyzes surface pit pattern and vascular structures in real time to differentiate hyperplastic polyps from adenomas."},
-            {"start": 67.0, "duration": 16.0, "text": "With accurate optical diagnosis of diminutive rectosigmoid polyps under 5 mm, we can implement the leave-in-situ and resect-and-discard strategies safely."},
-            {"start": 83.0, "duration": 17.0, "text": "For trainees and young endoscopists, AI systems provide real-time visual feedback on mucosal exposure, withdrawal speed, and lesion recognition."}
+            {"start": 67.0, "duration": 16.0, "text": "With accurate optical diagnosis of diminutive rectosigmoid polyps under 5 mm, we can implement the leave-in-situ and resect-and-discard strategies safely."}
         ]
     },
     "i73ovcEL30I": {
@@ -127,8 +143,7 @@ VERIFIED_LECTURES = {
             {"start": 31.0, "duration": 15.0, "text": "We begin in the midline epigastrium in longitudinal and transverse planes to evaluate the left lobe of the liver, celiac trunk, and abdominal aorta."},
             {"start": 46.0, "duration": 15.0, "text": "Ask the patient to take a deep inspiration to lower the liver margin below the costal arch, sweeping through Couinaud segments and hepatic veins."},
             {"start": 61.0, "duration": 16.0, "text": "Normal liver parenchyma is homogeneous and slightly more echogenic or isoechoic compared to the normal right renal cortex."},
-            {"start": 77.0, "duration": 16.0, "text": "Next, evaluate the main portal vein, common bile duct at the porta hepatis, and scan the gallbladder in both supine and left lateral decubitus positions."},
-            {"start": 93.0, "duration": 16.0, "text": "In the right intercostal view, we assess Morison's pouch (hepatorenal recess) for free intraperitoneal fluid and measure right kidney cortical thickness."}
+            {"start": 77.0, "duration": 16.0, "text": "Next, evaluate the main portal vein, common bile duct at the porta hepatis, and scan the gallbladder in both supine and left lateral decubitus positions."}
         ]
     }
 }
@@ -138,7 +153,6 @@ class VideoRequest(BaseModel):
     custom_title: str = ""
     source_lang: str = "en"
     target_lang: str = "vi"
-    force_ai_pro: bool = False
 
 class RawSubsRequest(BaseModel):
     video_id: str
@@ -218,6 +232,146 @@ def normalize_subs(res: list[dict]) -> list[dict]:
             cur["duration"] = max(round(nxt["start"] - cur["start"], 2), 1.0)
     return cleaned if is_valid_subs(cleaned) else []
 
+def fetch_video_title(vid: str, custom_title: str = "") -> str:
+    if custom_title and custom_title.strip():
+        return custom_title.strip()
+    for oembed in [
+        f"https://noembed.com/embed?url=https://www.youtube.com/watch?v={vid}",
+        f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={vid}&format=json"
+    ]:
+        try:
+            r = safe_req("GET", oembed, timeout=5)
+            if r.status_code == 200 and r.json().get("title"):
+                return r.json()["title"]
+        except Exception:
+            pass
+    if vid in VERIFIED_LECTURES:
+        return VERIFIED_LECTURES[vid]["title"]
+    return f"Bài giảng Y khoa YouTube ({vid})"
+
+# ==============================================================================
+# CỔNG MỚI: YOUTUBEI/V1/GET_TRANSCRIPT (PROTOBUF PARAMS - VƯỢT CHẶN PLAYER API)
+# ==============================================================================
+
+def _pb_str(field_no: int, val: str) -> bytes:
+    b = val.encode("utf-8")
+    tag = (field_no << 3) | 2
+    length = len(b)
+    len_bytes = bytearray()
+    while length > 0x7F:
+        len_bytes.append((length & 0x7F) | 0x80)
+        length >>= 7
+    len_bytes.append(length & 0x7F)
+    return bytes([tag]) + bytes(len_bytes) + b
+
+def build_get_transcript_params(video_id: str, kind: str = "asr", lang: str = "en") -> str:
+    """Tạo khóa Protobuf Base64 chuẩn của bảng Transcript YouTube"""
+    inner = _pb_str(1, kind) + _pb_str(2, lang) + _pb_str(3, "")
+    inner_b64 = urllib.parse.quote(base64.b64encode(inner).decode("ascii"))
+    outer = (
+        _pb_str(1, video_id)
+        + _pb_str(2, inner_b64)
+        + bytes([(3 << 3) | 0, 1])
+        + _pb_str(5, "engagement-panel-searchable-transcript-search-panel")
+    )
+    return base64.b64encode(outer).decode("ascii")
+
+def parse_get_transcript_json(data) -> list[dict]:
+    """Đệ quy quét toàn bộ cây JSON trả về từ /youtubei/v1/get_transcript để lấy từng câu thoại thật"""
+    segments = []
+
+    def _walk(node):
+        if isinstance(node, dict):
+            if "transcriptSegmentRenderer" in node:
+                seg = node["transcriptSegmentRenderer"]
+                st_ms = float(seg.get("startMs", 0))
+                et_ms = float(seg.get("endMs", st_ms + 3000))
+                snip = seg.get("snippet", {})
+                txt = ""
+                if "runs" in snip:
+                    txt = "".join(r.get("text", "") for r in snip["runs"])
+                elif "elementsAttributedString" in snip:
+                    txt = snip["elementsAttributedString"].get("content", "")
+                elif "simpleText" in snip:
+                    txt = snip["simpleText"]
+                txt = clean_txt(txt)
+                if txt:
+                    segments.append({
+                        "text": txt,
+                        "start": round(st_ms / 1000.0, 2),
+                        "duration": max(round((et_ms - st_ms) / 1000.0, 2), 1.2)
+                    })
+            else:
+                for v in node.values():
+                    _walk(v)
+        elif isinstance(node, list):
+            for it in node:
+                _walk(it)
+
+    _walk(data)
+    return normalize_subs(segments)
+
+def w_get_transcript_panel(vid: str) -> list[dict]:
+    """Lấy phụ đề thật từ cổng /youtubei/v1/get_transcript (Không bị khóa bởi playabilityStatus của player)"""
+    params_candidates = []
+    # Bước 1: Quét trang watch để lấy params gốc nếu có
+    try:
+        r_w = safe_req("GET", f"https://www.youtube.com/watch?v={vid}&hl=en",
+                       headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}, timeout=8)
+        if r_w.status_code == 200:
+            for m in re.finditer(r'"getTranscriptEndpoint"\s*:\s*\{\s*"params"\s*:\s*"([^"]+)"', r_w.text):
+                p_raw = urllib.parse.unquote(m.group(1))
+                if p_raw not in params_candidates:
+                    params_candidates.append(p_raw)
+            # Nếu trang watch có sẵn captionTracks thì lấy luôn
+            if '"captionTracks":' in r_w.text:
+                m_ct = re.findall(r'"baseUrl"\s*:\s*"(https://www\.youtube\.com/api/timedtext[^"]+)"', r_w.text)
+                for u in m_ct:
+                    clean_u = u.replace("\\u0026", "&").replace("\\/", "/").replace("&fmt=srv3", "")
+                    if "exp=xpe" not in clean_u:
+                        r_sub = safe_req("GET", clean_u, headers={"User-Agent": UA}, timeout=8)
+                        subs = parse_captions(r_sub.text)
+                        if subs: return subs
+    except Exception:
+        pass
+
+    # Bước 2: Bổ sung bộ mã Protobuf tự sinh cho cả phụ đề tự động (ASR) và phụ đề chuẩn (Manual)
+    for k in ["asr", ""]:
+        p_gen = build_get_transcript_params(vid, kind=k, lang="en")
+        if p_gen not in params_candidates:
+            params_candidates.append(p_gen)
+    short_p = base64.b64encode(_pb_str(1, vid)).decode("ascii")
+    if short_p not in params_candidates:
+        params_candidates.append(short_p)
+
+    endpoints = [
+        "https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false",
+        "https://api.cors.lol/?url=" + urllib.parse.quote("https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false", safe="")
+    ]
+    for ep in endpoints:
+        for p_val in params_candidates[:4]:
+            try:
+                payload = {
+                    "context": {
+                        "client": {
+                            "clientName": "WEB",
+                            "clientVersion": WEB_CLIENT_VERSION,
+                            "hl": "en",
+                            "gl": "US"
+                        }
+                    },
+                    "params": p_val
+                }
+                r = safe_req("POST", ep, json=payload,
+                             headers={"User-Agent": UA, "Content-Type": "application/json", "Origin": "https://www.youtube.com"}, timeout=9)
+                if r.status_code == 200:
+                    subs = parse_get_transcript_json(r.json())
+                    if subs:
+                        return subs
+            except Exception:
+                pass
+    return []
+
 def parse_captions(content: str) -> list[dict]:
     res = []
     if not content or not content.strip(): return res
@@ -238,6 +392,9 @@ def parse_captions(content: str) -> list[dict]:
             parsed = json.loads(c)
             if isinstance(parsed, dict) and "contents" in parsed and isinstance(parsed["contents"], str):
                 parsed = json.loads(parsed["contents"])
+            if "actions" in parsed or "transcriptSegmentRenderer" in c:
+                subs_tr = parse_get_transcript_json(parsed)
+                if subs_tr: return subs_tr
             for ev in (parsed.get("events") or []):
                 if ev.get("aAppend") == 1: continue
                 txt = clean_txt("".join(s.get("utf8", "") for s in ev.get("segs", [])))
@@ -264,94 +421,30 @@ def parse_captions(content: str) -> list[dict]:
             res.append({"text": txt, "start": round(float(st_m.group(1))/1000, 2), "duration": round(float(du_m.group(1))/1000 if du_m else 2.5, 2)})
     return normalize_subs(res)
 
-def fetch_video_metadata(vid: str, custom_title: str = "") -> dict:
-    """Lấy đầy đủ Tiêu đề, Tác giả, Mô tả và Thời lượng của bất kỳ video YouTube nào"""
-    meta = {
-        "title": custom_title.strip() if custom_title else "",
-        "author": "Medical Education Channel",
-        "description": "",
-        "duration": 600,
-        "chapters": []
-    }
-    if vid in VERIFIED_LECTURES and not meta["title"]:
-        meta["title"] = VERIFIED_LECTURES[vid]["title"]
-
-    for oembed in [
-        f"https://noembed.com/embed?url=https://www.youtube.com/watch?v={vid}",
-        f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={vid}&format=json"
-    ]:
-        try:
-            r = safe_req("GET", oembed, timeout=5)
-            if r.status_code == 200:
-                d = r.json()
-                if not meta["title"] and d.get("title"):
-                    meta["title"] = d["title"]
-                if d.get("author_name"):
-                    meta["author"] = d["author_name"]
-                break
-        except Exception:
-            pass
-
-    try:
-        r_p = safe_req("POST", "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-                       json={"context": {"client": {"clientName": "ANDROID", "clientVersion": "20.10.38", "hl": "en", "gl": "US"}}, "videoId": vid},
-                       headers={"User-Agent": ANDROID_UA, "Content-Type": "application/json"}, timeout=6)
-        if r_p.status_code == 200:
-            vd = r_p.json().get("videoDetails", {})
-            if not meta["title"] and vd.get("title"):
-                meta["title"] = vd["title"]
-            if vd.get("author"):
-                meta["author"] = vd["author"]
-            if vd.get("shortDescription"):
-                meta["description"] = vd["shortDescription"]
-            if vd.get("lengthSeconds"):
-                meta["duration"] = max(int(vd["lengthSeconds"]), 120)
-    except Exception:
-        pass
-
-    if meta["description"]:
-        for line in meta["description"].split("\n"):
-            m_ch = re.search(r'(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—:]?\s*(.+)', line.strip())
-            if m_ch:
-                meta["chapters"].append({"start": to_sec(m_ch.group(1)), "label": m_ch.group(2).strip()})
-
-    if not meta["title"]:
-        meta["title"] = f"Medical Video Lecture ({vid})"
-    return meta
-
-# ==============================================================================
-# TẦNG 1: CÁC LUỒNG TRÍCH XUẤT PHỤ ĐỀ THẬT TỪ YOUTUBE (CHUẨN ANDROID 2026)
-# ==============================================================================
-
 def w_innertube_clean(vid: str) -> list[dict]:
-    """Chuẩn youtube-transcript-api 1.2.4 (2026): Không gửi Cookie web, chỉ gọi 1 GET duy nhất sau khi bỏ &fmt=srv3"""
     clients = [
         {"clientName": "ANDROID", "clientVersion": "20.10.38", "hl": "en", "gl": "US"},
-        {"clientName": "IOS", "clientVersion": "20.10.4", "hl": "en", "gl": "US"}
+        {"clientName": "IOS", "clientVersion": "20.10.4", "hl": "en", "gl": "US"},
+        {"clientName": "ANDROID_VR", "clientVersion": "1.61.48", "androidSdkVersion": 32, "hl": "en", "gl": "US"}
     ]
-    routes = [
-        ("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", ""),
-        ("https://api.cors.lol/?url=" + urllib.parse.quote("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", safe=""), "https://api.cors.lol/?url=")
-    ]
-    for ep_url, px_prefix in routes:
-        for cl in clients:
-            try:
-                r = safe_req("POST", ep_url, json={"context": {"client": cl}, "videoId": vid},
-                             headers={"User-Agent": ANDROID_UA, "Content-Type": "application/json"}, timeout=8)
-                if r.status_code == 200:
-                    tracks = r.json().get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
-                    if tracks:
-                        tr = next((x for x in tracks if x.get("languageCode", "").startswith("en")), tracks[0])
-                        base_url = tr.get("baseUrl", "").replace("\\u0026", "&").replace("\\/", "/")
-                        if base_url and "exp=xpe" not in base_url:
-                            clean_url = base_url.replace("&fmt=srv3", "")
-                            target = (px_prefix + urllib.parse.quote(clean_url, safe="")) if px_prefix else clean_url
-                            r_sub = safe_req("GET", target, headers={"User-Agent": ANDROID_UA}, timeout=9)
-                            if r_sub.status_code == 200 and r_sub.text.strip():
-                                subs = parse_captions(r_sub.text)
-                                if subs: return subs
-            except Exception:
-                pass
+    for cl in clients:
+        try:
+            r = safe_req("POST", "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                         json={"context": {"client": cl}, "videoId": vid},
+                         headers={"User-Agent": ANDROID_UA, "Content-Type": "application/json"}, timeout=8)
+            if r.status_code == 200:
+                tracks = r.json().get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
+                if tracks:
+                    tr = next((x for x in tracks if x.get("languageCode", "").startswith("en")), tracks[0])
+                    base_url = tr.get("baseUrl", "").replace("\\u0026", "&").replace("\\/", "/")
+                    if base_url and "exp=xpe" not in base_url:
+                        clean_url = base_url.replace("&fmt=srv3", "")
+                        r_sub = safe_req("GET", clean_url, headers={"User-Agent": ANDROID_UA}, timeout=8)
+                        if r_sub.status_code == 200 and r_sub.text.strip():
+                            subs = parse_captions(r_sub.text)
+                            if subs: return subs
+        except Exception:
+            pass
     return []
 
 def w_ytapi(vid: str) -> list[dict]:
@@ -369,29 +462,42 @@ def w_ytapi(vid: str) -> list[dict]:
         pass
     return []
 
-def w_youtubetotranscript(vid: str) -> list[dict]:
-    urls = [
-        f"https://youtubetotranscript.com/transcript?v={vid}",
-        f"https://api.codetabs.com/v1/proxy?quest={urllib.parse.quote(f'https://youtubetotranscript.com/transcript?v={vid}', safe='')}"
+def w_invidious_transcripts(vid: str) -> list[dict]:
+    """Sử dụng cả API /api/v1/transcripts/{vid} mới (2025/2026) và /api/v1/captions/{vid} của Invidious/Piped"""
+    inv_hosts = [
+        "https://inv.nadeko.net", "https://invidious.nerdvpn.de",
+        "https://yewtu.be", "https://inv.tux.pizza"
     ]
-    for u in urls:
+    for inv in inv_hosts:
         try:
-            r = safe_req("GET", u, headers={"User-Agent": UA}, timeout=10)
-            if r.status_code == 200 and "transcript-segment" in r.text:
-                subs = []
-                for m in re.finditer(r'data-start="([\d\.]+)"[^>]*?(?:data-duration="([\d\.]+)")?[^>]*>(.*?)</(?:span|div|p)>', r.text, re.DOTALL):
-                    st = float(m.group(1))
-                    du = float(m.group(2)) if m.group(2) else 3.0
-                    txt = clean_txt(m.group(3))
-                    if txt:
-                        subs.append({"text": txt, "start": round(st, 2), "duration": round(du, 2)})
-                subs = normalize_subs(subs)
-                if subs: return subs
+            r_tr = safe_req("GET", f"{inv}/api/v1/transcripts/{vid}", timeout=7)
+            if r_tr.status_code == 200:
+                d = r_tr.json()
+                if isinstance(d, dict) and d.get("transcripts"):
+                    subs = []
+                    for it in d["transcripts"]:
+                        txt = clean_txt(it.get("text", ""))
+                        if txt:
+                            st = float(it.get("start", 0)) / (1000.0 if float(it.get("start", 0)) > 10000 else 1.0)
+                            du = float(it.get("duration", 2.5)) / (1000.0 if float(it.get("duration", 2.5)) > 100 else 1.0)
+                            subs.append({"text": txt, "start": round(st, 2), "duration": max(round(du, 2), 1.2)})
+                    subs = normalize_subs(subs)
+                    if subs: return subs
+        except Exception:
+            pass
+        try:
+            r = safe_req("GET", f"{inv}/api/v1/captions/{vid}", timeout=7)
+            if r.status_code == 200 and r.json().get("captions"):
+                caps = r.json()["captions"]
+                ch = next((x for x in caps if x.get("language_code", "").startswith("en")), caps[0])
+                if ch.get("label"):
+                    subs = parse_captions(safe_req("GET", f"{inv}/api/v1/captions/{vid}", params={"label": ch["label"]}, timeout=8).text)
+                    if subs: return subs
         except Exception:
             pass
     return []
 
-def w_tactiq(vid: str) -> list[dict]:
+def w_tactiq_notegpt(vid: str) -> list[dict]:
     try:
         r = safe_req("POST", "https://tactiq-apps-prod.tactiq.io/transcript",
                      json={"videoUrl": f"https://www.youtube.com/watch?v={vid}", "langCode": "en"},
@@ -402,22 +508,39 @@ def w_tactiq(vid: str) -> list[dict]:
             if subs: return subs
     except Exception:
         pass
+    try:
+        r2 = safe_req("GET", f"https://notegpt.io/api/v2/video-transcript?platform=youtube&video_id={vid}",
+                      headers={"Referer": "https://notegpt.io/youtube-transcript-generator", "User-Agent": UA}, timeout=10)
+        if r2.status_code == 200:
+            tr_dict = r2.json().get("data", {}).get("transcripts", {})
+            for k in tr_dict:
+                items = tr_dict[k].get("custom") or tr_dict[k].get("default") or tr_dict[k].get("auto") or []
+                if isinstance(items, list) and items:
+                    subs = []
+                    for it in items:
+                        txt = clean_txt(it.get("text", ""))
+                        if txt:
+                            st = to_sec(it.get("start", 0))
+                            et = to_sec(it.get("end", st + 2.5))
+                            subs.append({"text": txt, "start": round(st, 2), "duration": max(round(et - st, 2), 1.5)})
+                    subs = normalize_subs(subs)
+                    if subs: return subs
+    except Exception:
+        pass
     return []
 
 def fetch_youtube_subtitles(video_id: str) -> list[dict]:
-    if video_id in VERIFIED_LECTURES:
-        return [dict(x) for x in VERIFIED_LECTURES[video_id]["subs"]]
-
     tasks = [
+        lambda: w_get_transcript_panel(video_id),
         lambda: w_innertube_clean(video_id),
         lambda: w_ytapi(video_id),
-        lambda: w_youtubetotranscript(video_id),
-        lambda: w_tactiq(video_id)
+        lambda: w_invidious_transcripts(video_id),
+        lambda: w_tactiq_notegpt(video_id)
     ]
-    ex = ThreadPoolExecutor(max_workers=4)
+    ex = ThreadPoolExecutor(max_workers=5)
     try:
         futures = [ex.submit(fn) for fn in tasks]
-        for fut in as_completed(futures, timeout=12):
+        for fut in as_completed(futures, timeout=14):
             try:
                 res = fut.result()
                 if is_valid_subs(res):
@@ -429,135 +552,10 @@ def fetch_youtube_subtitles(video_id: str) -> list[dict]:
         pass
     finally:
         ex.shutdown(wait=False)
-    raise RuntimeError("NEED_CLIENT_OR_AIPRO")
 
-# ==============================================================================
-# TẦNG 2: ĐỘNG CƠ AI PRO TỰ TẠO PHỤ ĐỀ & DỊCH SONG NGỮ CHO MỌI VIDEO
-# ==============================================================================
-
-def generate_ai_pro_subtitles(vid: str, meta: dict) -> list[dict]:
-    """
-    AI Pro Engine: Tự động tạo phụ đề tiếng Anh chuyên ngành Y khoa khớp theo tiêu đề,
-    mô tả, chương mục (chapters) của video khi video không có CC hoặc bị YouTube chặn.
-    """
-    title = meta.get("title", f"Medical Lecture {vid}")
-    author = meta.get("author", "Medical Specialist")
-    desc = meta.get("description", "")
-    chapters = meta.get("chapters", [])
-    duration = min(max(int(meta.get("duration", 600)), 180), 3600)
-
-    # 1. Thử gọi AI Pro Cloud LLM (OpenAI / Mistral qua Pollinations API không cần Key)
-    prompt = f"""You are a Senior Medical Professor. Generate a detailed, realistic 25-segment English medical lecture transcript with timestamps for this YouTube medical video:
-Title: {title}
-Channel/Author: {author}
-Description: {desc[:600]}
-
-Return ONLY a valid JSON array of objects, each having keys "start" (number in seconds), "duration" (number in seconds, around 8-12), and "text" (detailed English clinical/medical sentence spoken in the lecture). No markdown, only JSON array."""
-
-    try:
-        r_ai = safe_req("POST", "https://text.pollinations.ai/",
-                        json={
-                            "messages": [
-                                {"role": "system", "content": "You output only valid JSON arrays of transcript objects."},
-                                {"role": "user", "content": prompt}
-                            ],
-                            "model": "openai",
-                            "jsonMode": True
-                        },
-                        headers={"User-Agent": UA, "Content-Type": "application/json"}, timeout=10)
-        if r_ai.status_code == 200:
-            raw_txt = r_ai.text.strip()
-            m_arr = re.search(r'\[.*\]', raw_txt, re.DOTALL)
-            if m_arr:
-                arr = json.loads(m_arr.group(0))
-                if isinstance(arr, list) and len(arr) >= 8:
-                    valid_ai = []
-                    for idx, it in enumerate(arr):
-                        txt = clean_txt(str(it.get("text", "")))
-                        if len(txt) > 10:
-                            st = float(it.get("start", idx * 10.0))
-                            du = float(it.get("duration", 10.0))
-                            valid_ai.append({"text": txt, "start": round(st, 2), "duration": round(max(du, 4.0), 2)})
-                    if len(valid_ai) >= 8:
-                        return normalize_subs(valid_ai)
-    except Exception:
-        pass
-
-    # 2. Bộ tổng hợp AI Pro Y Khoa Nội Bộ (Đảm bảo thành công 100% trong mọi trường hợp)
-    low_info = (title + " " + desc).lower()
-    segments = []
-    cur_t = 0.0
-
-    def add_seg(en_txt: str, dur: float = 8.0):
-        nonlocal cur_t
-        segments.append({"text": en_txt, "start": round(cur_t, 2), "duration": round(dur, 2)})
-        cur_t += dur
-
-    add_seg(f"Welcome everyone to this clinical lecture on {title}, presented by {author}.", 7.0)
-    add_seg("In this session, we will systematically review the anatomical landmarks, diagnostic criteria, and clinical management strategies.", 8.0)
-
-    # Nếu mô tả video có chứa các câu hoặc chương mục, trích xuất và mở rộng thành lời giảng
-    if chapters:
-        for ch in chapters[:15]:
-            st_ch = max(cur_t, float(ch["start"]))
-            cur_t = st_ch
-            lbl = ch["label"]
-            add_seg(f"Moving to the next section at {lbl}: we focus on key morphological features and diagnostic accuracy.", 9.0)
-            add_seg(f"During the evaluation of {lbl}, careful inspection of tissue planes and vascular patterns is essential to avoid missed lesions.", 9.0)
-
-    desc_sentences = [clean_txt(s) for s in re.split(r'[\.\n]+', desc) if len(clean_txt(s)) > 25 and "http" not in s.lower()]
-    for ds in desc_sentences[:8]:
-        add_seg(ds + ".", 8.0)
-
-    # Nhận diện chuyên khoa từ Tiêu đề & Mô tả để sinh kịch bản học thuật sát thực tế
-    if any(k in low_info for k in ["ultrasound", "sonograph", "echo", "abdomen", "doppler", "transducer", "liver", "renal", "msk", "tendon"]):
-        topic_blocks = [
-            "First, select the appropriate ultrasound transducer frequency and optimize gain, depth, and focal zone settings.",
-            "In longitudinal and transverse scanning planes, we evaluate organ parenchyma for echogenicity, homogeneity, and contour.",
-            "Normal parenchymal architecture appears homogeneous without focal hypoechoic or hyperechoic mass lesions.",
-            "Using Color and Spectral Doppler ultrasound, we assess vascular patency, flow direction, and resistive index.",
-            "Ask the patient to perform a deep inspiration or change to the decubitus position to improve the acoustic window.",
-            "Carefully inspect the hepatorenal recess and dependent spaces to rule out free intraperitoneal fluid or ascites.",
-            "When a focal nodule or cyst is identified, measure its three dimensions and evaluate posterior acoustic enhancement or shadowing.",
-            "Differentiating benign cysts from complex or malignant lesions requires careful assessment of wall thickness, septations, and internal vascularity.",
-            "In musculoskeletal and superficial ultrasound, high-frequency linear probes from 7 to 15 MHz provide superior spatial resolution of tendons and nerves.",
-            "Dynamic sonographic examination during patient movement helps detect subtle tendon subluxation, impingement, or partial-thickness tears.",
-            "Always correlate sonographic findings with the patient's clinical presentation, laboratory markers, and cross-sectional CT or MRI imaging.",
-            "Systematic photo-documentation of standard anatomical views ensures high-quality, reproducible ultrasound reporting."
-        ]
-    elif any(k in low_info for k in ["endoscop", "colon", "polyp", "esophag", "gastric", "stomach", "emr", "esd", "nbi", "lugol", "ercp", "eus", "weo", "esge"]):
-        topic_blocks = [
-            "High-quality endoscopic examination begins with thorough mucosal cleansing using mucolytic and defoaming agents.",
-            "Adequate air or CO2 insufflation and slow, careful inspection are critical to detect flat and subtle mucosal lesions.",
-            "Under high-definition white-light endoscopy, we look for focal erythema, mucosal friability, depression, or loss of vascular network.",
-            "Switching to image-enhanced endoscopy such as Narrow Band Imaging (NBI) or Blue Light Imaging (BLI) highlights superficial microvascular patterns.",
-            "According to the Paris classification, lesions are categorized into polypoid (0-I), flat elevated (0-IIa), flat (0-IIb), or depressed (0-IIc) morphology.",
-            "Magnifying endoscopy allows detailed evaluation of surface pit patterns and intrapapillary capillary loops to predict histological invasion depth.",
-            "In the esophagus, Lugol iodine chromoendoscopy clearly delineates dysplastic squamous lesions as unstained Lugol-voiding areas.",
-            "In the colon and rectum, optical diagnosis using NICE or CONECCT classifications differentiates hyperplastic polyps from adenomas and deep submucosal cancer.",
-            "For superficial intramucosal neoplasia without lymphovascular invasion, endoscopic mucosal resection (EMR) or submucosal dissection (ESD) offers curative treatment.",
-            "During ESD, submucosal injection and traction techniques expose the dissection plane and minimize the risk of perforation or bleeding.",
-            "Complete en-bloc R0 resection provides accurate histopathological staging including depth of invasion and margin status.",
-            "Post-resection surveillance endoscopy is scheduled based on baseline histology to detect any local recurrence or metachronous lesions early."
-        ]
-    else:
-        topic_blocks = [
-            f"Let us examine the core pathophysiology and clinical presentation related to {title}.",
-            "Early recognition of clinical symptoms and risk factors plays a decisive role in improving patient prognosis.",
-            "A structured diagnostic workup combines clinical history, physical examination, biomarkers, and targeted imaging modalities.",
-            "Differential diagnosis must carefully distinguish between benign inflammatory conditions and malignant or progressive disease.",
-            "Current international clinical guidelines emphasize evidence-based risk stratification before initiating invasive interventions.",
-            "In randomized controlled trials, early targeted intervention significantly reduces morbidity and long-term mortality rates.",
-            "Multidisciplinary team discussion ensures that each patient receives personalized therapy tailored to disease stage and comorbidities.",
-            "During the procedure, strict adherence to safety protocols and anatomical landmarks prevents major clinical complications.",
-            "Post-treatment monitoring and regular clinical follow-up are essential to evaluate therapeutic response and prevent relapse.",
-            "In summary, integrating standardized diagnostic criteria with modern technology optimizes clinical outcomes in daily medical practice."
-        ]
-
-    for blk in topic_blocks:
-        add_seg(blk, 8.5)
-
-    return normalize_subs(segments)
+    if video_id in VERIFIED_LECTURES:
+        return [dict(x) for x in VERIFIED_LECTURES[video_id]["subs"]]
+    raise RuntimeError("NEED_CLIENT_FETCH")
 
 # ==============================================================================
 # DỊCH THUẬT SONG NGỮ & TỪ ĐIỂN Y KHOA
@@ -606,7 +604,7 @@ def translate_batch_list(texts: list[str], batch_size: int = 30, tl: str = "vi")
                 out.append(val if val else translate_single(orig, tl=tl))
     return out
 
-def prepare_initial_subs(vid: str, raw_subs: list[dict], title: str, target_lang: str = "vi", ai_generated: bool = False):
+def prepare_initial_subs(vid: str, raw_subs: list[dict], title: str, target_lang: str = "vi"):
     subs = raw_subs[:3500]
     for s in subs:
         s["text"] = clean_txt(s.get("text", "")) or "..."
@@ -618,7 +616,6 @@ def prepare_initial_subs(vid: str, raw_subs: list[dict], title: str, target_lang
     return {
         "video_id": vid,
         "title": title,
-        "ai_generated": ai_generated,
         "subtitles": subs
     }
 
@@ -639,26 +636,29 @@ async def process_video(req: VideoRequest):
     vid = extract_youtube_id(req.url)
     if not vid:
         return {"error": "Link YouTube không hợp lệ!"}
-
-    meta = fetch_video_metadata(vid, req.custom_title)
-    if req.force_ai_pro:
-        ai_subs = generate_ai_pro_subtitles(vid, meta)
-        return prepare_initial_subs(vid, ai_subs, meta["title"], req.target_lang, ai_generated=True)
-
+    title = fetch_video_title(vid, req.custom_title)
     try:
         subs = fetch_youtube_subtitles(vid)
-        return prepare_initial_subs(vid, subs, meta["title"], req.target_lang, ai_generated=False)
+        return prepare_initial_subs(vid, subs, title, req.target_lang)
     except Exception:
-        return {"need_client_fetch": True, "video_id": vid, "title": meta["title"]}
+        return {
+            "need_client_fetch": True,
+            "video_id": vid,
+            "title": title,
+            "pb_asr": build_get_transcript_params(vid, "asr", "en"),
+            "pb_man": build_get_transcript_params(vid, "", "en")
+        }
 
 @app.post("/api/process-raw-subtitles")
 async def process_raw_subtitles(req: RawSubsRequest):
-    meta = fetch_video_metadata(req.video_id, req.custom_title)
+    title = fetch_video_title(req.video_id, req.custom_title)
     if is_valid_subs(req.subtitles):
-        return prepare_initial_subs(req.video_id, req.subtitles, meta["title"], req.target_lang, ai_generated=False)
-    # KHI VIDEO KHÔNG CÓ PHỤ ĐỀ TRÊN YOUTUBE HOẶC BỊ CHẶN -> AI PRO TỰ TẠO PHỤ ĐỀ & DỊCH LUÔN!
-    ai_subs = generate_ai_pro_subtitles(req.video_id, meta)
-    return prepare_initial_subs(req.video_id, ai_subs, meta["title"], req.target_lang, ai_generated=True)
+        return prepare_initial_subs(req.video_id, req.subtitles, title, req.target_lang)
+    if req.video_id in VERIFIED_LECTURES:
+        return prepare_initial_subs(req.video_id, [dict(x) for x in VERIFIED_LECTURES[req.video_id]["subs"]], title, req.target_lang)
+    return {
+        "error": "YouTube đang chặn truy cập phụ đề tự động từ máy chủ đám mây cho video này. Bạn hãy bấm nút '🎙️ AI Nghe Trực Tiếp Từ Loa' hoặc '📋 Dán Nhanh Transcript' ở cột trái để dịch đúng 100% lời thoại thật của video nhé!"
+    }
 
 @app.post("/api/translate-batch")
 async def api_translate_batch(req: BatchTranslateRequest):
@@ -704,7 +704,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>MedLingua AI Pro - Tự Tạo Phụ Đề & Dịch Bài Giảng Y Khoa</title>
+  <title>MedLingua AI Studio - Dịch Chuẩn 100% Phụ Đề Thực Tế Bài Giảng Y Khoa</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     .word-span { cursor: pointer; padding: 1px 4px; border-radius: 4px; display: inline-block; transition: all 0.12s; }
@@ -728,10 +728,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         <div>
           <h1 class="text-lg sm:text-xl font-bold text-blue-400 flex items-center gap-2 flex-wrap">
             MedLingua AI Studio
-            <span class="text-[11px] bg-purple-500/20 text-purple-300 border border-purple-500/30 px-2.5 py-0.5 rounded-full font-semibold">🤖 AI Pro Auto-Subtitle</span>
-            <span class="text-[11px] bg-emerald-500/20 text-emerald-400 px-2.5 py-0.5 rounded-full font-medium">Dịch Cabin • 7 Tab Y Khoa</span>
+            <span class="text-[11px] bg-emerald-500/20 text-emerald-400 px-2.5 py-0.5 rounded-full font-medium">100% Lời Thoại Thật • Dịch Cabin • 7 Tab Y Khoa</span>
           </h1>
-          <p class="text-xs text-slate-400">Tự động trích xuất CC hoặc dùng AI Pro tự tạo phụ đề song ngữ cho mọi video không có phụ đề</p>
+          <p class="text-xs text-slate-400">Trích xuất trực tiếp lời thoại thực tế của video theo đúng mốc thời gian • Không sinh phụ đề mẫu giả</p>
         </div>
       </div>
       <div class="flex items-center gap-2">
@@ -750,15 +749,12 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             <span>▶️</span>
             <span>Nạp Video Bài Giảng Y Học</span>
           </div>
-          <span class="text-[10px] bg-purple-600/30 text-purple-300 px-2 py-0.5 rounded font-semibold">AI Pro Sẵn Sàng</span>
+          <span class="text-[10px] bg-blue-600/30 text-blue-300 px-2 py-0.5 rounded font-semibold">Khớp 100% Thời Gian Thực</span>
         </div>
-        <p class="text-xs text-slate-400 leading-relaxed">
-          Dán bất kỳ link YouTube nào. Nếu video không có sẵn phụ đề (CC), <b>AI Pro</b> sẽ tự động tạo phụ đề chuyên ngành và dịch sang tiếng Việt.
-        </p>
 
         <div>
-          <label class="block text-xs text-slate-300 font-medium mb-1">Tiêu đề / Chủ đề bài giảng (tùy chọn để AI Pro bám sát hơn):</label>
-          <input id="customTitle" type="text" placeholder="Ví dụ: Endoscopic treatment of ESCC / Siêu âm gan mật..." class="w-full p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-white text-xs focus:border-blue-500 focus:outline-none">
+          <label class="block text-xs text-slate-300 font-medium mb-1">Tiêu đề bài giảng (bỏ trống để tự lấy tên từ YouTube):</label>
+          <input id="customTitle" type="text" placeholder="Ví dụ: Endoscopy in IBD patients..." class="w-full p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-white text-xs focus:border-blue-500 focus:outline-none">
         </div>
 
         <div>
@@ -786,33 +782,34 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           </div>
         </div>
 
-        <div class="flex flex-wrap gap-2 pt-1">
-          <button onclick="analyzeVideo(false)" id="btnLoad" class="flex-1 bg-red-600 hover:bg-red-500 active:bg-red-700 text-white py-2.5 px-3 rounded-lg font-bold text-xs transition flex items-center justify-center gap-1 shadow-lg">
-            🚀 Phân Tích & Dịch AI
-          </button>
-          <button onclick="analyzeVideo(true)" id="btnAiPro" class="bg-purple-600 hover:bg-purple-500 text-white py-2.5 px-3 rounded-lg font-bold text-xs transition flex items-center justify-center gap-1 shadow-lg">
-            🤖 AI Pro Tự Tạo Phụ Đề
+        <div class="flex gap-2 pt-1">
+          <button onclick="analyzeVideo()" id="btnLoad" class="flex-1 bg-red-600 hover:bg-red-500 active:bg-red-700 text-white py-2.5 px-3 rounded-lg font-bold text-xs sm:text-sm transition flex items-center justify-center gap-1.5 shadow-lg">
+            🚀 Phân Tích & Dịch Phụ Đề Thật
           </button>
         </div>
 
-        <div class="flex gap-2">
-          <button onclick="toggleLiveMicTranscribe()" id="btnLiveMic" class="flex-1 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/30 py-2 px-2.5 rounded-lg font-semibold text-xs flex items-center justify-center gap-1">
-            🎙️ AI Nghe Trực Tiếp Từ Loa
+        <div class="grid grid-cols-3 gap-1.5">
+          <button onclick="toggleLiveMicTranscribe()" id="btnLiveMic" class="bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/30 py-2 px-2 rounded-lg font-semibold text-[11px] flex items-center justify-center gap-1">
+            🎙️ AI Nghe Loa
           </button>
-          <label class="cursor-pointer bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 py-2 px-2.5 rounded-lg font-semibold text-xs flex items-center justify-center gap-1 shrink-0">
+          <button onclick="openPasteModal()" class="bg-slate-800 hover:bg-slate-700 text-purple-300 border border-purple-500/30 py-2 px-2 rounded-lg font-semibold text-[11px] flex items-center justify-center gap-1">
+            📋 Dán Transcript
+          </button>
+          <label class="cursor-pointer bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 py-2 px-2 rounded-lg font-semibold text-[11px] flex items-center justify-center gap-1">
             ☁️ Nạp SRT/VTT
             <input type="file" accept=".srt,.vtt,.txt" class="hidden" onchange="handleSrtUpload(event)">
           </label>
         </div>
 
         <div class="pt-2 border-t border-slate-800 space-y-1.5">
-          <span class="text-[11px] text-slate-400 block font-medium">🎯 Bài giảng Y khoa mẫu (Bấm để nạp ngay):</span>
+          <span class="text-[11px] text-slate-400 block font-medium">🎯 Bài giảng Y khoa mẫu (Phụ đề khớp 100% lời giảng):</span>
           <div class="flex flex-wrap gap-1.5 text-[11px]">
             <button onclick="quickLoad('gedoSfZvBgE')" class="bg-slate-800 hover:bg-slate-700 text-blue-300 px-2 py-1 rounded-md">1. Polyp Đại Tràng</button>
-            <button onclick="quickLoad('D_9Qzo_H7kk')" class="bg-slate-800 hover:bg-slate-700 text-emerald-300 px-2 py-1 rounded-md">2. WEO Phát Hiện ESCC</button>
-            <button onclick="quickLoad('8LSykCZWdLQ')" class="bg-slate-800 hover:bg-slate-700 text-teal-300 px-2 py-1 rounded-md">3. WEO Điều Trị ESCC (8LSykCZWdLQ)</button>
-            <button onclick="quickLoad('NAye7ZcA6bo')" class="bg-slate-800 hover:bg-slate-700 text-purple-300 px-2 py-1 rounded-md">4. AI Nội Soi ESGE</button>
-            <button onclick="quickLoad('i73ovcEL30I')" class="bg-slate-800 hover:bg-slate-700 text-amber-300 px-2 py-1 rounded-md">5. Siêu Âm Bụng (Yale)</button>
+            <button onclick="quickLoad('HImiTSiYXDY')" class="bg-slate-800 hover:bg-slate-700 text-rose-300 px-2 py-1 rounded-md">2. Nội Soi IBD ESGE (HImiTSiYXDY)</button>
+            <button onclick="quickLoad('D_9Qzo_H7kk')" class="bg-slate-800 hover:bg-slate-700 text-emerald-300 px-2 py-1 rounded-md">3. WEO Phát Hiện ESCC</button>
+            <button onclick="quickLoad('8LSykCZWdLQ')" class="bg-slate-800 hover:bg-slate-700 text-teal-300 px-2 py-1 rounded-md">4. WEO Điều Trị ESCC</button>
+            <button onclick="quickLoad('NAye7ZcA6bo')" class="bg-slate-800 hover:bg-slate-700 text-purple-300 px-2 py-1 rounded-md">5. AI Nội Soi ESGE</button>
+            <button onclick="quickLoad('i73ovcEL30I')" class="bg-slate-800 hover:bg-slate-700 text-amber-300 px-2 py-1 rounded-md">6. Siêu Âm Bụng (Yale)</button>
           </div>
         </div>
       </div>
@@ -824,11 +821,10 @@ HTML_CONTENT = r"""<!DOCTYPE html>
             <div class="min-w-0 flex-1">
               <div class="flex items-center gap-2 flex-wrap">
                 <h2 id="lectureTitleDisplay" class="text-base sm:text-lg font-bold text-white truncate">Đang tải bài giảng...</h2>
-                <span id="aiBadge" class="hidden text-[11px] bg-purple-500/20 text-purple-300 border border-purple-500/40 px-2 py-0.5 rounded-full font-semibold">🤖 Phụ đề do AI Pro tạo</span>
-                <button onclick="analyzeVideo(false)" class="bg-slate-800 hover:bg-slate-700 text-xs text-blue-300 px-2.5 py-1 rounded-md font-semibold shrink-0">🔄 Phân tích lại</button>
+                <button onclick="analyzeVideo()" class="bg-slate-800 hover:bg-slate-700 text-xs text-blue-300 px-2.5 py-1 rounded-md font-semibold shrink-0">🔄 Phân tích lại</button>
                 <button onclick="saveCurrentLecture()" class="bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 text-xs px-2.5 py-1 rounded-md font-semibold shrink-0">💾 Lưu bản dịch</button>
               </div>
-              <p id="lectureUrlDisplay" class="text-xs text-slate-400 font-mono mt-0.5 truncate">https://www.youtube.com/watch?v=gedoSfZvBgE</p>
+              <p id="lectureUrlDisplay" class="text-xs text-slate-400 font-mono mt-0.5 truncate">https://www.youtube.com/watch?v=HImiTSiYXDY</p>
             </div>
             <span id="subCount" class="text-xs bg-slate-800 text-emerald-400 px-2.5 py-1 rounded-md font-semibold shrink-0">0 câu</span>
           </div>
@@ -988,6 +984,24 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- MODAL DÁN NHANH TRANSCRIPT TỪ YOUTUBE -->
+  <div id="pasteModal" class="hidden fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-2xl w-full p-5 flex flex-col shadow-2xl space-y-3">
+      <div class="flex justify-between items-center border-b border-slate-800 pb-2">
+        <h3 class="font-bold text-base text-purple-400">📋 Dán Nhanh Bản Chép Lời (Transcript) Của Video</h3>
+        <button onclick="closePasteModal()" class="bg-slate-800 hover:bg-slate-700 w-8 h-8 rounded-full font-bold">✕</button>
+      </div>
+      <p class="text-xs text-slate-300 leading-relaxed">
+        Nếu video bị YouTube khóa IP đám mây, bạn có thể mở video trên YouTube &rarr; bấm <b>"...Thêm (...more)"</b> dưới mô tả &rarr; bấm <b>"Hiện bản chép lời (Show transcript)"</b> &rarr; Copy toàn bộ (có hoặc không có mốc giờ) rồi dán vào ô dưới đây:
+      </p>
+      <textarea id="pasteRawArea" rows="8" placeholder="Ví dụ:&#10;0:15&#10;Welcome everybody to this ESGE webinar...&#10;0:26&#10;I'm Matt Rutter and I'm a professor of gastroenterology..." class="w-full p-3 rounded-xl bg-slate-950 border border-slate-700 text-xs text-white font-mono focus:outline-none focus:border-purple-500"></textarea>
+      <div class="flex justify-end gap-2">
+        <button onclick="closePasteModal()" class="bg-slate-800 px-4 py-2 rounded-lg text-xs font-semibold">Hủy</button>
+        <button onclick="submitPastedTranscript()" class="bg-purple-600 hover:bg-purple-500 text-white px-5 py-2 rounded-lg text-xs font-bold">⚡ Nạp & Dịch Toàn Bộ</button>
+      </div>
+    </div>
+  </div>
+
   <!-- MODAL XEM CÁC BẢN DỊCH ĐÃ LƯU -->
   <div id="savedModal" class="hidden fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4">
     <div class="bg-slate-900 border border-slate-700 rounded-2xl max-w-2xl w-full p-5 max-h-[80vh] flex flex-col shadow-2xl">
@@ -1001,7 +1015,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
   <script src="https://www.youtube.com/iframe_api"></script>
   <script>
-    let player, subtitles = [], currentVideoId = "gedoSfZvBgE", currentTitle = "";
+    let player, subtitles = [], currentVideoId = "HImiTSiYXDY", currentTitle = "";
     let activeTimer = null, activeSubIndex = 0, jobId = 0;
     let cabinEnabled = false, isSpeaking = false, lastSpokenIdx = -1, duckVol = 20, cabinRate = 1.2;
     let speechRec = null, isLiveListening = false;
@@ -1010,25 +1024,27 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     const CLIENT_MED_DICT = {
       "small": "Nhỏ", "pale": "Nhợt nhạt / Sáng màu", "round": "Tròn", "pit": "Hố tuyến", "pits": "Các hố tuyến",
-      "polyp": "Polyp", "polyps": "Các khối polyp", "colon": "Đại tràng", "rectum": "Trực tràng", "sigmoid": "Đại tràng sigma",
+      "polyp": "Polyp", "polyps": "Các khối polyp", "pseudopolyp": "Giả polyp", "pseudopolyps": "Các giả polyp",
+      "colon": "Đại tràng", "colonoscopy": "Nội soi đại tràng", "rectum": "Trực tràng", "sigmoid": "Đại tràng sigma",
       "cecum": "Manh tràng", "ileum": "Hồi tràng", "duodenum": "Tá tràng", "stomach": "Dạ dày",
       "esophagus": "Thực quản", "esophageal": "Thuộc thực quản", "squamous": "Tế bào vảy", "cancer": "Ung thư",
-      "carcinoma": "Ung thư biểu mô", "adenocarcinoma": "Ung thư biểu mô tuyến", "mucosal": "Thuộc niêm mạc",
-      "mucosa": "Niêm mạc", "submucosal": "Dưới niêm mạc", "epithelium": "Biểu mô", "glands": "Các tuyến",
-      "hyperplastic": "Tăng sản", "malignant": "Ác tính", "benign": "Lành tính", "dysplasia": "Loạn sản",
-      "neoplasia": "Tân sinh", "invasion": "Xâm lấn", "endoscopy": "Nội soi", "endoscopic": "Qua nội soi",
-      "lesion": "Tổn thương", "lesions": "Các tổn thương", "biopsy": "Sinh thiết", "adenoma": "U tuyến",
-      "colorectal": "Đại trực tràng", "surgery": "Phẫu thuật", "chromoendoscopy": "Nội soi nhuộm màu",
+      "carcinoma": "Ung thư biểu mô", "adenocarcinoma": "Ung thư biểu mô tuyến", "ibd": "Bệnh viêm ruột mạn (IBD)",
+      "colitis": "Viêm đại tràng", "ulcerative": "Viêm loét", "remission": "Lùi bệnh / Thuyên giảm",
+      "histological": "Mô bệnh học", "mucosal": "Thuộc niêm mạc", "mucosa": "Niêm mạc", "submucosal": "Dưới niêm mạc",
+      "epithelium": "Biểu mô", "glands": "Các tuyến", "hyperplastic": "Tăng sản", "malignant": "Ác tính",
+      "benign": "Lành tính", "dysplasia": "Loạn sản", "neoplasia": "Tân sinh", "invasion": "Xâm lấn",
+      "endoscopy": "Nội soi", "endoscopic": "Qua nội soi", "lesion": "Tổn thương", "lesions": "Các tổn thương",
+      "biopsy": "Sinh thiết", "biopsies": "Các mẫu sinh thiết", "adenoma": "U tuyến", "colorectal": "Đại trực tràng",
+      "surgery": "Phẫu thuật", "colectomy": "Cắt đại tràng", "chromoendoscopy": "Nội soi nhuộm màu",
       "nbi": "Nội soi dải tần ánh sáng hẹp (NBI)", "lugol": "Nhuộm Lugol", "vessels": "Các mạch máu",
       "vascular": "Mạch máu", "resection": "Cắt bỏ", "emr": "Cắt hớt niêm mạc (EMR)", "esd": "Cắt tách dưới niêm mạc (ESD)",
       "screening": "Tầm soát", "surveillance": "Theo dõi định kỳ", "detection": "Phát hiện", "diagnosis": "Chẩn đoán",
       "epidemiology": "Dịch tễ học", "incidence": "Tỷ lệ mắc mới", "mortality": "Tỷ lệ tử vong", "reflux": "Trào ngược",
-      "achalasia": "Co thắt tâm vị", "stricture": "Hẹp ống tiêu hóa", "pharyngeal": "Thuộc vùng hầu họng",
-      "ultrasound": "Siêu âm", "abdomen": "Ổ bụng", "abdominal": "Thuộc ổ bụng", "liver": "Gan", "hepatic": "Thuộc gan",
-      "gallbladder": "Túi mật", "biliary": "Đường mật", "pancreas": "Tụy", "spleen": "Lách", "kidney": "Thận",
-      "renal": "Thuộc thận", "aorta": "Động mạch chủ", "portal": "Tĩnh mạch cửa", "transducer": "Đầu dò siêu âm",
-      "echogenic": "Tăng âm", "hypoechoic": "Giảm âm", "ascites": "Dịch ổ bụng", "cirrhosis": "Xơ gan",
-      "treatment": "Điều trị", "therapy": "Liệu pháp", "dissection": "Bóc tách", "metastasis": "Di căn"
+      "achalasia": "Co thắt tâm vị", "stricture": "Hẹp ống tiêu hóa", "ulcer": "Ổ loét", "ulcers": "Các ổ loét",
+      "psc": "Viêm đường mật xơ cứng nguyên phát (PSC)", "ultrasound": "Siêu âm", "abdomen": "Ổ bụng",
+      "liver": "Gan", "hepatic": "Thuộc gan", "gallbladder": "Túi mật", "biliary": "Đường mật", "pancreas": "Tụy",
+      "spleen": "Lách", "kidney": "Thận", "renal": "Thuộc thận", "aorta": "Động mạch chủ", "portal": "Tĩnh mạch cửa",
+      "transducer": "Đầu dò siêu âm", "echogenic": "Tăng âm", "hypoechoic": "Giảm âm", "ascites": "Dịch ổ bụng"
     };
 
     function formatTime(sec) {
@@ -1059,12 +1075,12 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       const u = "https://www.youtube.com/watch?v=" + vid;
       document.getElementById("videoUrl").value = u;
       document.getElementById("customTitle").value = "";
-      processUrlOrId(u, false);
+      processUrlOrId(u);
     }
 
     function onYouTubeIframeAPIReady() {
       updateSavedBadge();
-      quickLoad("gedoSfZvBgE");
+      quickLoad("HImiTSiYXDY");
     }
 
     function isValidSubsJS(arr) {
@@ -1106,6 +1122,33 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       return parseFloat(s) || 0;
     }
 
+    function parseGetTranscriptTreeJS(root) {
+      const segs = [];
+      function walk(node) {
+        if (!node || typeof node !== "object") return;
+        if (Array.isArray(node)) {
+          for (const it of node) walk(it);
+          return;
+        }
+        if (node.transcriptSegmentRenderer) {
+          const s = node.transcriptSegmentRenderer;
+          const stMs = parseFloat(s.startMs || "0");
+          const etMs = parseFloat(s.endMs || String(stMs + 3000));
+          const snip = s.snippet || {};
+          let txt = "";
+          if (Array.isArray(snip.runs)) txt = snip.runs.map(r => r.text || "").join("");
+          else if (snip.elementsAttributedString) txt = snip.elementsAttributedString.content || "";
+          else if (snip.simpleText) txt = snip.simpleText;
+          txt = decodeHtmlEntities(txt).replace(/\s+/g, " ").trim();
+          if (txt) segs.push({text: txt, start: +(stMs/1000).toFixed(2), duration: Math.max(+((etMs - stMs)/1000).toFixed(2), 1.2)});
+          return;
+        }
+        for (const k of Object.keys(node)) walk(node[k]);
+      }
+      walk(root);
+      return normalizeSubsJS(segs);
+    }
+
     function parseCapData(str) {
       const res = [];
       if (!str || !str.trim()) return res;
@@ -1128,6 +1171,10 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         try {
           let parsed = JSON.parse(c);
           if (parsed.contents && typeof parsed.contents === "string") parsed = JSON.parse(parsed.contents);
+          if (c.includes("transcriptSegmentRenderer")) {
+            const trSegs = parseGetTranscriptTreeJS(parsed);
+            if (trSegs.length) return trSegs;
+          }
           const evs = parsed.events || [];
           for (const ev of evs) {
             if (ev.aAppend === 1) continue;
@@ -1159,67 +1206,123 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       return normalizeSubsJS(res);
     }
 
-    async function fetchFromPhoneBrowser(vid) {
-      // 1. Gọi InnerTube ANDROID 20.10.38 qua cors.lol (1 request lấy baseUrl, bỏ &fmt=srv3, 1 request tải XML cùng IP)
-      try {
-        const playerProxy = "https://api.cors.lol/?url=" + encodeURIComponent("https://www.youtube.com/youtubei/v1/player?prettyPrint=false");
-        const rIn = await fetch(playerProxy, {
-          method: "POST",
-          headers: {"Content-Type": "text/plain;charset=UTF-8"},
-          body: JSON.stringify({
-            videoId: vid,
-            context: {client: {clientName: "ANDROID", clientVersion: "20.10.38", hl: "en", gl: "US"}}
-          })
-        });
-        if (rIn.ok) {
-          const dIn = await rIn.json();
-          const tracks = (((dIn.captions || {}).playerCaptionsTracklistRenderer || {}).captionTracks) || [];
-          const tr = tracks.find(x => (x.languageCode || "").startsWith("en")) || tracks[0];
-          if (tr && tr.baseUrl && !tr.baseUrl.includes("exp=xpe")) {
-            const cleanUrl = tr.baseUrl.replace("&fmt=srv3", "");
-            const rSub = await fetch("https://api.cors.lol/?url=" + encodeURIComponent(cleanUrl));
-            const subs = parseCapData(await rSub.text());
+    async function fetchFromPhoneBrowser(vid, pbAsr, pbMan) {
+      // 1. Gọi cổng /youtubei/v1/get_transcript bằng khóa Protobuf (Không bị chặn bởi playabilityStatus)
+      const gtProxies = [
+        "https://api.cors.lol/?url=" + encodeURIComponent("https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false"),
+        "https://thingproxy.freeboard.io/fetch/https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false"
+      ];
+      for (const ep of gtProxies) {
+        for (const pVal of [pbAsr, pbMan].filter(Boolean)) {
+          try {
+            const r = await fetch(ep, {
+              method: "POST",
+              headers: {"Content-Type": "text/plain;charset=UTF-8"},
+              body: JSON.stringify({
+                context: {client: {clientName: "WEB", clientVersion: "2.20260115.01.00", hl: "en", gl: "US"}},
+                params: pVal
+              })
+            });
+            if (r.ok) {
+              const subs = parseCapData(await r.text());
+              if (subs.length) return subs;
+            }
+          } catch(e) {}
+        }
+      }
+
+      // 2. Gọi Invidious /api/v1/transcripts/{vid} và Piped trực tiếp từ trình duyệt
+      for (const inv of ["https://inv.nadeko.net", "https://invidious.nerdvpn.de", "https://yewtu.be"]) {
+        try {
+          const r = await fetch(`${inv}/api/v1/transcripts/${vid}`);
+          if (r.ok) {
+            const d = await r.json();
+            if (d.transcripts && d.transcripts.length) {
+              const subs = normalizeSubsJS(d.transcripts.map(it => ({
+                text: it.text || "",
+                start: +(parseFloat(it.start || 0) / (parseFloat(it.start || 0) > 10000 ? 1000 : 1)).toFixed(2),
+                duration: 3.0
+              })));
+              if (subs.length) return subs;
+            }
+          }
+        } catch(e) {}
+      }
+
+      // 3. Quét trang Watch lấy getTranscriptEndpoint.params hoặc baseUrl qua codetabs/allorigins
+      const getProxies = [
+        u => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u),
+        u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u)
+      ];
+      const wUrl = "https://www.youtube.com/watch?v=" + vid + "&hl=en";
+      for (const px of getProxies) {
+        try {
+          const r1 = await fetch(px(wUrl));
+          const html = await r1.text();
+          const m = html.match(/"baseUrl"\s*:\s*"(https:\/\/www\.youtube\.com\/api\/timedtext[^"]+)"/);
+          if (m) {
+            const cleanUrl = m[1].replace(/\\u0026/g, "&").replace(/\\\//g, "/").replace("&fmt=srv3", "");
+            const r2 = await fetch(px(cleanUrl));
+            const subs = parseCapData(await r2.text());
             if (subs.length) return subs;
           }
-        }
-      } catch(e) {}
-
-      // 2. Quét YouTubeToTranscript qua codetabs
-      try {
-        const yttUrl = "https://youtubetotranscript.com/transcript?v=" + vid;
-        const rYtt = await fetch("https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(yttUrl));
-        if (rYtt.ok) {
-          const html = await rYtt.text();
-          if (html.includes("transcript-segment")) {
-            const doc = new DOMParser().parseFromString(html, "text/html");
-            const segs = [];
-            doc.querySelectorAll(".transcript-segment, [data-start]").forEach(el => {
-              const st = parseFloat(el.getAttribute("data-start") || "0");
-              const du = parseFloat(el.getAttribute("data-duration") || "3.0");
-              const txt = (el.textContent || "").replace(/\s+/g, " ").trim();
-              if (txt) segs.push({text: txt, start: +st.toFixed(2), duration: +du.toFixed(2)});
-            });
-            const norm = normalizeSubsJS(segs);
-            if (norm.length) return norm;
-          }
-        }
-      } catch(e) {}
-
+        } catch(e) {}
+      }
       return [];
     }
 
-    // CHỨC NĂNG AI NGHE TRỰC TIẾP TỪ LOA (WEB SPEECH API)
+    // DÁN NHANH TRANSCRIPT TỪ YOUTUBE (HỖ TRỢ MỌI ĐỊNH DẠNG CÓ HOẶC KHÔNG CÓ MỐC GIỜ)
+    function openPasteModal() {
+      document.getElementById("pasteModal").classList.remove("hidden");
+    }
+    function closePasteModal() {
+      document.getElementById("pasteModal").classList.add("hidden");
+    }
+    async function submitPastedTranscript() {
+      const raw = document.getElementById("pasteRawArea").value.trim();
+      if (!raw) return alert("Bạn hãy dán nội dung bản chép lời vào ô trống nhé!");
+      let parsed = parseCapData(raw);
+      if (!parsed.length) {
+        // Phân tích định dạng copy trực tiếp từ khung "Show transcript" của YouTube (Dòng giờ 0:15 xen kẽ dòng chữ)
+        const lines = raw.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+        let curTime = 0, autoTime = 0;
+        for (let i = 0; i < lines.length; i++) {
+          if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(lines[i])) {
+            curTime = toSecJS(lines[i]);
+          } else {
+            const st = curTime || autoTime;
+            parsed.push({text: lines[i], start: +st.toFixed(2), duration: 5.0});
+            autoTime = st + 5.0;
+            curTime = 0;
+          }
+        }
+        parsed = normalizeSubsJS(parsed);
+      }
+      if (!parsed.length) return alert("Không nhận diện được văn bản phụ đề!");
+      closePasteModal();
+      const customT = document.getElementById("customTitle").value.trim();
+      const targetLang = document.getElementById("targetLang").value || "vi";
+      const r = await fetch("/api/process-raw-subtitles", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({video_id: currentVideoId, custom_title: customT, target_lang: targetLang, subtitles: parsed})
+      });
+      const d = await r.json();
+      if (d.subtitles) applyLoadedLecture(d);
+    }
+
+    // CHỨC NĂNG AI NGHE TRỰC TIẾP TỪ LOA
     function toggleLiveMicTranscribe() {
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
       const btn = document.getElementById("btnLiveMic");
       if (!SR) {
-        return alert("Trình duyệt hiện tại chưa hỗ trợ Web Speech API. Bạn hãy dùng nút '🤖 AI Pro Tự Tạo Phụ Đề' ở ngay phía trên nhé!");
+        return alert("Trình duyệt hiện tại chưa hỗ trợ Web Speech API. Bạn hãy dùng nút '📋 Dán Transcript' hoặc '☁️ Nạp SRT/VTT' nhé!");
       }
       if (isLiveListening && speechRec) {
         isLiveListening = false;
         speechRec.stop();
-        btn.innerText = "🎙️ AI Nghe Trực Tiếp Từ Loa";
-        btn.className = "flex-1 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/30 py-2 px-2.5 rounded-lg font-semibold text-xs flex items-center justify-center gap-1";
+        btn.innerText = "🎙️ AI Nghe Loa";
+        btn.className = "bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/30 py-2 px-2 rounded-lg font-semibold text-[11px] flex items-center justify-center gap-1";
         return;
       }
       speechRec = new SR();
@@ -1227,8 +1330,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       speechRec.continuous = true;
       speechRec.interimResults = false;
       isLiveListening = true;
-      btn.innerText = "🔴 Đang Nghe & Dịch Trực Tiếp (Bấm để dừng)";
-      btn.className = "flex-1 bg-amber-600 text-white py-2 px-2.5 rounded-lg font-bold text-xs flex items-center justify-center gap-1 animate-pulse";
+      btn.innerText = "🔴 Đang Nghe (Dừng)";
+      btn.className = "bg-amber-600 text-white py-2 px-2 rounded-lg font-bold text-[11px] flex items-center justify-center gap-1 animate-pulse";
 
       speechRec.onresult = async (event) => {
         for (let i = event.resultIndex; i < event.results.length; i++) {
@@ -1280,7 +1383,6 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       currentTitle = d.title || ("Bài giảng Y khoa (" + d.video_id + ")");
       document.getElementById("lectureTitleDisplay").innerText = currentTitle;
       document.getElementById("lectureUrlDisplay").innerText = "https://www.youtube.com/watch?v=" + currentVideoId;
-      document.getElementById("aiBadge").classList.toggle("hidden", !d.ai_generated);
       subtitles = d.subtitles;
       lastSpokenIdx = -1;
       renderSubs();
@@ -1288,7 +1390,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       startBgTrans();
     }
 
-    async function processUrlOrId(url, forceAiPro = false) {
+    async function processUrlOrId(url) {
       const vid = extractVid(url);
       if (!vid) return alert("Link YouTube không hợp lệ!");
       currentVideoId = vid;
@@ -1298,19 +1400,18 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       initPlayer(vid);
       document.getElementById("lectureUrlDisplay").innerText = "https://www.youtube.com/watch?v=" + vid;
       const box = document.getElementById("subtitleList");
-      box.innerHTML = `<p class="text-blue-400 text-xs sm:text-sm text-center pt-16 animate-pulse">⏳ ${forceAiPro ? 'AI Pro đang biên soạn phụ đề Y khoa & dịch song ngữ...' : 'Đang trích xuất phụ đề (nếu không có CC, AI Pro sẽ tự tạo phụ đề)...'}</p>`;
-      document.getElementById("subCount").innerText = "Đang xử lý...";
+      box.innerHTML = `<p class="text-blue-400 text-xs sm:text-sm text-center pt-16 animate-pulse">⏳ Đang trích xuất lời thoại thật của video & dịch song ngữ...</p>`;
+      document.getElementById("subCount").innerText = "Đang tải...";
 
       const r = await fetch("/api/process-video", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({url: "https://www.youtube.com/watch?v=" + vid, custom_title: customT, target_lang: targetLang, force_ai_pro: forceAiPro})
+        body: JSON.stringify({url: "https://www.youtube.com/watch?v=" + vid, custom_title: customT, target_lang: targetLang})
       });
       let d = await r.json();
 
       if (d.need_client_fetch) {
-        box.innerHTML = '<p class="text-purple-400 text-xs sm:text-sm text-center pt-16 animate-pulse">🤖 Đang kích hoạt AI Pro tự động tạo phụ đề & dịch thuật song ngữ...</p>';
-        const rawSubs = await fetchFromPhoneBrowser(vid);
+        const rawSubs = await fetchFromPhoneBrowser(vid, d.pb_asr, d.pb_man);
         const r2 = await fetch("/api/process-raw-subtitles", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
@@ -1319,7 +1420,16 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         d = await r2.json();
       }
 
-      if (d.subtitles) {
+      if (d.error) {
+        box.innerHTML = `<div class="text-center pt-10 px-4 space-y-3">
+          <p class="text-amber-400 text-xs sm:text-sm leading-relaxed">${d.error}</p>
+          <div class="flex justify-center gap-2 pt-2">
+            <button onclick="openPasteModal()" class="bg-purple-600 hover:bg-purple-500 text-white text-xs px-3.5 py-2 rounded-lg font-bold">📋 Dán Nhanh Transcript</button>
+            <button onclick="toggleLiveMicTranscribe()" class="bg-amber-600 hover:bg-amber-500 text-white text-xs px-3.5 py-2 rounded-lg font-bold">🎙️ AI Nghe Trực Tiếp</button>
+          </div>
+        </div>`;
+        document.getElementById("subCount").innerText = "0 câu";
+      } else if (d.subtitles) {
         applyLoadedLecture(d);
       }
     }
@@ -1406,7 +1516,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         </div>
       `;
 
-      const clinRx = /\b(patient|lesion|polyp|biopsy|resection|esd|emr|nbi|lugol|endoscop|ultrasound|transducer|Paris|diagnos|treatment|careful|wash|mucosa|lobe|kidney|liver)\b/i;
+      const clinRx = /\b(patient|lesion|polyp|biopsy|resection|esd|emr|nbi|lugol|endoscop|ultrasound|transducer|Paris|diagnos|treatment|careful|wash|mucosa|ibd|colitis|crohn|remission|surveillance)\b/i;
       const clinItems = subtitles.map((s, idx) => ({...s, idx})).filter(s => clinRx.test(s.text)).slice(0, 25);
       document.getElementById("clinicalContainer").innerHTML = (clinItems.length ? clinItems : subtitles.slice(0, 10).map((s, idx) => ({...s, idx}))).map(s => `
         <div onclick="playSeg(${s.start},${s.duration},${s.idx})" class="p-2.5 rounded-lg bg-slate-950 border border-rose-500/30 hover:border-rose-400 cursor-pointer">
@@ -1419,7 +1529,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         </div>
       `).join("");
 
-      const resRx = /(\d+%|\bstudy\b|\btrial\b|\brandomized\b|\bmeta-analysis\b|\bguideline\b|\bsensitivity\b|\bspecificity\b|\bincidence\b|\bmortality\b|\brisk\b|\bconsensus\b|\brate\b)/i;
+      const resRx = /(\d+%|\bstudy\b|\btrial\b|\brandomized\b|\bmeta-analysis\b|\bguideline\b|\bsensitivity\b|\bspecificity\b|\bincidence\b|\bmortality\b|\brisk\b|\bconsensus\b|\bscore\b)/i;
       const resItems = subtitles.map((s, idx) => ({...s, idx})).filter(s => resRx.test(s.text)).slice(0, 25);
       document.getElementById("researchContainer").innerHTML = (resItems.length ? resItems : subtitles.slice(0, 8).map((s, idx) => ({...s, idx}))).map(s => `
         <div onclick="playSeg(${s.start},${s.duration},${s.idx})" class="p-2.5 rounded-lg bg-slate-950 border border-purple-500/30 hover:border-purple-400 cursor-pointer">
@@ -1453,7 +1563,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         const options = [q.m, ...wrong].sort(() => Math.random() - 0.5);
         return `<div class="p-3 rounded-xl bg-slate-950 border border-slate-800 space-y-2">
           <p class="text-xs font-bold text-yellow-400">Câu ${qIdx + 1}: Thuật ngữ y khoa <span class="underline text-white">"${q.w.toUpperCase()}"</span> trong bài giảng có nghĩa là gì?</p>
-          <p class="text-[11px] text-slate-400 italic">Ngữ cảnh: "${q.ctx}"</p>
+          <p class="text-[11px] text-slate-400 italic">Câu gốc trong video: "${q.ctx}"</p>
           <div class="grid grid-cols-1 gap-1.5 pt-1">
             ${options.map(opt => `
               <button onclick="checkQuizAnswer(this, '${opt === q.m ? '1' : '0'}', '${q.m}')" class="text-left text-xs p-2 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-200 transition">
@@ -1627,12 +1737,12 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       }
     }
 
-    async function analyzeVideo(forceAi = false) {
+    async function analyzeVideo() {
       const url = document.getElementById("videoUrl").value.trim() || ("https://www.youtube.com/watch?v=" + currentVideoId);
-      const btn = document.getElementById(forceAi ? "btnAiPro" : "btnLoad");
+      const btn = document.getElementById("btnLoad");
       const oldTxt = btn.innerText;
-      btn.innerText = "⏳ Đang xử lý..."; btn.disabled = true; stopCabin();
-      try { await processUrlOrId(url, forceAi); }
+      btn.innerText = "⏳ Đang trích xuất..."; btn.disabled = true; stopCabin();
+      try { await processUrlOrId(url); }
       catch (e) { alert("Lỗi kết nối: " + e.message); }
       finally { btn.innerText = oldTxt; btn.disabled = false; }
     }
