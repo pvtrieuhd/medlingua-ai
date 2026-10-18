@@ -10,7 +10,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Tự động cập nhật ngầm thư viện lấy phụ đề mới nhất khi server khởi động
 def _bg_upgrade_packages():
     try:
         subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "youtube-transcript-api", "yt-dlp"], timeout=60)
@@ -84,8 +83,23 @@ def to_sec(val) -> float:
     try: return float(s)
     except Exception: return 0.0
 
+def is_valid_subs(subs: list[dict]) -> bool:
+    """Chặn tuyệt đối các câu báo lỗi giả dạng phụ đề từ các trang bên thứ 3"""
+    if not subs or len(subs) == 0:
+        return False
+    joined = " ".join(s.get("text", "").lower() for s in subs[:5])
+    bad_phrases = [
+        "blocking us from fetching",
+        "generating a summary for you",
+        "working on a fix",
+        "subtitles are disabled",
+        "transcript is not available"
+    ]
+    if any(bp in joined for bp in bad_phrases):
+        return False
+    return True
+
 def normalize_subs(res: list[dict]) -> list[dict]:
-    """Chuẩn hóa thời gian không bị chồng lấn đối với phụ đề tự động (ASR) của hội nghị dài"""
     if not res: return []
     cleaned = []
     for item in res:
@@ -99,7 +113,7 @@ def normalize_subs(res: list[dict]) -> list[dict]:
         nxt = cleaned[i + 1]
         if cur["start"] + cur["duration"] > nxt["start"] and nxt["start"] > cur["start"]:
             cur["duration"] = max(round(nxt["start"] - cur["start"], 2), 1.0)
-    return cleaned
+    return cleaned if is_valid_subs(cleaned) else []
 
 def parse_captions(content: str) -> list[dict]:
     res = []
@@ -118,7 +132,10 @@ def parse_captions(content: str) -> list[dict]:
         if res: return normalize_subs(res)
     if c.startswith("{"):
         try:
-            for ev in json.loads(c).get("events", []):
+            parsed = json.loads(c)
+            if isinstance(parsed, dict) and "contents" in parsed and isinstance(parsed["contents"], str):
+                parsed = json.loads(parsed["contents"])
+            for ev in (parsed.get("events") or []):
                 if ev.get("aAppend") == 1: continue
                 txt = clean_txt("".join(s.get("utf8", "") for s in ev.get("segs", [])))
                 if txt:
@@ -143,45 +160,15 @@ def parse_captions(content: str) -> list[dict]:
             res.append({"text": txt, "start": round(float(st_m.group(1))/1000, 2), "duration": round(float(du_m.group(1))/1000 if du_m else 2.5, 2)})
     return normalize_subs(res)
 
-def extract_cap_url(html_str: str):
-    if not html_str or '"captionTracks":' not in html_str:
-        return None
-    idx = html_str.find('"captionTracks":')
-    start_bracket = html_str.find('[', idx)
-    if start_bracket != -1:
-        depth = 0
-        in_str = False
-        esc = False
-        for i in range(start_bracket, min(start_bracket + 35000, len(html_str))):
-            ch = html_str[i]
-            if esc: esc = False; continue
-            if ch == '\\': esc = True; continue
-            if ch == '"': in_str = not in_str; continue
-            if not in_str:
-                if ch == '[': depth += 1
-                elif ch == ']':
-                    depth -= 1
-                    if depth == 0:
-                        try:
-                            tracks = json.loads(html_str[start_bracket:i+1])
-                            if tracks:
-                                tr = next((x for x in tracks if x.get("languageCode", "").startswith("en")), tracks[0])
-                                return tr.get("baseUrl")
-                        except Exception:
-                            break
-    urls = re.findall(r'"baseUrl"\s*:\s*"(https://www\.youtube\.com/api/timedtext[^"]+)"', html_str)
-    for u in urls:
-        clean_u = u.replace("\\u0026", "&").replace("\\/", "/")
-        if "lang=en" in clean_u: return clean_u
-    return urls[0].replace("\\u0026", "&").replace("\\/", "/") if urls else None
-
-def fetch_clean_timedtext(raw_url: str, ua: str = UA) -> list[dict]:
-    """Xóa bỏ &fmt=srv3 cũ trước khi gắn &fmt=json3 để tránh xung đột định dạng phụ đề tự động"""
+def fetch_clean_timedtext(raw_url: str, ua: str = UA, proxy_prefix: str = "") -> list[dict]:
+    """Tải phụ đề qua đúng IP đã gọi player để khớp chữ ký sparams=ip"""
     if not raw_url: return []
     base_clean = re.sub(r"&fmt=[^&]+", "", raw_url.replace("\\u0026", "&").replace("\\/", "/"))
     for suffix in ["&fmt=json3", "&fmt=srv1", ""]:
+        target_u = base_clean + suffix
+        fetch_u = (proxy_prefix + urllib.parse.quote(target_u, safe="")) if proxy_prefix else target_u
         try:
-            r = safe_req("GET", base_clean + suffix, use_session=False, headers={"User-Agent": ua}, timeout=10)
+            r = safe_req("GET", fetch_u, use_session=False, headers={"User-Agent": ua}, timeout=10)
             if r.status_code == 200 and r.text.strip():
                 subs = parse_captions(r.text)
                 if subs: return subs
@@ -191,25 +178,35 @@ def fetch_clean_timedtext(raw_url: str, ua: str = UA) -> list[dict]:
 
 def w_innertube(vid: str):
     visitor_data = ""
+    host_flags = ""
     try:
         r_emb = safe_req("GET", f"https://www.youtube.com/embed/{vid}", use_session=False, headers={"User-Agent": UA}, timeout=6)
         m_v = re.search(r'"(?:visitorData|VISITOR_DATA)"\s*:\s*"([^"]+)"', r_emb.text)
         if m_v: visitor_data = m_v.group(1)
+        m_f = re.search(r'"encryptedHostFlags"\s*:\s*"([^"]+)"', r_emb.text)
+        if m_f: host_flags = m_f.group(1)
     except Exception:
         pass
 
+    tv_ctx = {"client": {"clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER", "clientVersion": "2.0", "hl": "en", "gl": "US"}, "thirdParty": {"embedUrl": "https://www.youtube.com/"}}
+    if host_flags:
+        tv_ctx["thirdParty"]["encryptedHostFlags"] = host_flags
+        tv_ctx["client"]["configInfo"] = {"encryptedHostFlags": host_flags}
+
     clients = [
+        ("28", {"client": {"clientName": "ANDROID_VR", "clientVersion": "1.61.48", "deviceMake": "Oculus", "deviceModel": "Quest 3", "androidSdkVersion": 32, "userAgent": "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip", "osName": "Android", "osVersion": "12L", "hl": "en", "gl": "US"}}),
         ("3", {"client": {"clientName": "ANDROID", "clientVersion": "20.10.38", "androidSdkVersion": 30, "userAgent": "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip", "hl": "en", "gl": "US"}}),
         ("5", {"client": {"clientName": "IOS", "clientVersion": "20.10.4", "deviceMake": "Apple", "deviceModel": "iPhone16,2", "userAgent": "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)", "hl": "en", "gl": "US"}}),
-        ("28", {"client": {"clientName": "ANDROID_VR", "clientVersion": "1.61.48", "androidSdkVersion": 34, "userAgent": "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 14; en_US; Quest 3; Build/UP1A.231005.007.A1) gzip", "hl": "en", "gl": "US"}}),
-        ("56", {"client": {"clientName": "WEB_EMBEDDED_PLAYER", "clientVersion": "1.20250310.01.00", "hl": "en", "gl": "US"}, "thirdParty": {"embedUrl": "https://www.youtube.com/"}})
+        ("85", tv_ctx)
     ]
-    endpoints = [
-        "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-        "https://api.cors.lol/?url=https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-        "https://thingproxy.freeboard.io/fetch/https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+
+    # (URL gọi player, Tiền tố Proxy tương ứng để tải baseUrl cùng 1 IP)
+    routes = [
+        ("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", ""),
+        ("https://api.cors.lol/?url=" + urllib.parse.quote("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", safe=""), "https://api.cors.lol/?url=")
     ]
-    for ep in endpoints:
+
+    for ep_url, px_prefix in routes:
         for c_id, ctx in clients:
             try:
                 if visitor_data:
@@ -224,33 +221,70 @@ def w_innertube(vid: str):
                 }
                 if visitor_data:
                     hdrs["X-Goog-Visitor-Id"] = visitor_data
-                r = safe_req("POST", ep, use_session=False, json={"videoId": vid, "context": ctx}, headers=hdrs, timeout=9)
+                r = safe_req("POST", ep_url, use_session=False, json={"videoId": vid, "context": ctx}, headers=hdrs, timeout=10)
                 if r.status_code == 200:
                     tracks = r.json().get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
                     if tracks:
                         tr = next((x for x in tracks if x.get("languageCode", "").startswith("en")), tracks[0])
                         cu = tr.get("baseUrl", "")
                         if cu and "exp=xpe" not in cu:
-                            subs = fetch_clean_timedtext(cu, ua)
+                            subs = fetch_clean_timedtext(cu, ua, px_prefix)
                             if subs: return subs
             except Exception:
                 pass
     return []
 
-def w_yttrans(vid: str):
-    urls = [
-        f"https://youtubetranscript.com/?server_vid2={vid}",
-        f"https://api.codetabs.com/v1/proxy?quest={urllib.parse.quote(f'https://youtubetranscript.com/?server_vid2={vid}', safe='')}",
-        f"https://api.cors.lol/?url={urllib.parse.quote(f'https://youtubetranscript.com/?server_vid2={vid}', safe='')}"
-    ]
-    for u in urls:
-        try:
-            r = safe_req("GET", u, use_session=False, headers={"User-Agent": UA, "Referer": "https://youtubetranscript.com/"}, timeout=12)
-            if r.status_code == 200 and ("<text" in r.text or "<p" in r.text):
-                subs = parse_captions(r.text)
+def w_ytdlp(vid: str):
+    try:
+        import yt_dlp
+        ydl_opts = {
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": ["en.*", "en"],
+            "extractor_args": {"youtube": {"player_client": ["android_vr", "ios", "tv_embedded"]}}
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+            for key in ["subtitles", "automatic_captions"]:
+                sub_dict = info.get(key) or {}
+                for lang_k in sub_dict:
+                    if lang_k.startswith("en"):
+                        formats = sub_dict[lang_k]
+                        for fmt_ext in ["json3", "srv1", "vtt"]:
+                            chosen = next((f for f in formats if f.get("ext") == fmt_ext), None)
+                            if chosen and chosen.get("url") and "exp=xpe" not in chosen["url"]:
+                                r = safe_req("GET", chosen["url"], use_session=False, headers={"User-Agent": UA}, timeout=10)
+                                subs = parse_captions(r.text)
+                                if subs: return subs
+    except Exception:
+        pass
+    return []
+
+def w_ytapi(vid: str):
+    langs = ['en', 'en-US', 'en-GB', 'a.en', 'en-CA', 'en-AU', 'en-IN']
+    try:
+        if hasattr(YouTubeTranscriptApi, "fetch"):
+            fetched = YouTubeTranscriptApi().fetch(vid, languages=langs)
+            subs = normalize_subs([{"text": clean_txt(s.text), "start": round(s.start, 2), "duration": round(s.duration, 2)} for s in fetched if clean_txt(s.text)])
+            if subs: return subs
+        if hasattr(YouTubeTranscriptApi, "get_transcript"):
+            raw = YouTubeTranscriptApi.get_transcript(vid, languages=langs)
+            subs = normalize_subs([{"text": clean_txt(s["text"]), "start": round(s["start"], 2), "duration": round(s["duration"], 2)} for s in raw if clean_txt(s.get("text", ""))])
+            if subs: return subs
+    except Exception:
+        pass
+    try:
+        if hasattr(YouTubeTranscriptApi, "list"):
+            t_list = YouTubeTranscriptApi().list(vid)
+            for tr in t_list:
+                fetched = tr.fetch()
+                subs = normalize_subs([{"text": clean_txt(s.text), "start": round(s.start, 2), "duration": round(s.duration, 2)} for s in fetched if clean_txt(s.text)])
                 if subs: return subs
-        except Exception:
-            pass
+    except Exception:
+        pass
     return []
 
 def w_tactiq(vid: str):
@@ -258,10 +292,11 @@ def w_tactiq(vid: str):
         try:
             r = safe_req("POST", ep, use_session=False,
                          json={"videoUrl": f"https://www.youtube.com/watch?v={vid}", "langCode": "en"},
-                         headers={"Origin": "https://tactiq.io", "Referer": "https://tactiq.io/", "Content-Type": "application/json", "User-Agent": UA}, timeout=18)
+                         headers={"Origin": "https://tactiq.io", "Referer": "https://tactiq.io/", "Content-Type": "application/json", "User-Agent": UA}, timeout=16)
             if r.status_code == 200 and r.json().get("captions"):
                 subs = [{"text": clean_txt(c.get("text", "")), "start": round(to_sec(c.get("start", 0)), 2), "duration": round(to_sec(c.get("dur", 2.5)), 2)} for c in r.json()["captions"] if clean_txt(c.get("text", ""))]
-                if subs: return normalize_subs(subs)
+                subs = normalize_subs(subs)
+                if subs: return subs
         except Exception:
             pass
     return []
@@ -281,90 +316,25 @@ def w_notegpt(vid: str):
                         st = to_sec(it.get("start", 0))
                         et = to_sec(it.get("end", st + 2.5))
                         subs.append({"text": txt, "start": round(st, 2), "duration": max(round(et - st, 2), 1.5)})
-                if subs: return normalize_subs(subs)
-    return []
-
-def w_ytapi(vid: str):
-    langs = ['en', 'en-US', 'en-GB', 'a.en', 'en-CA', 'en-AU', 'en-IN']
-    try:
-        if hasattr(YouTubeTranscriptApi, "fetch"):
-            fetched = YouTubeTranscriptApi().fetch(vid, languages=langs)
-            return normalize_subs([{"text": clean_txt(s.text), "start": round(s.start, 2), "duration": round(s.duration, 2)} for s in fetched if clean_txt(s.text)])
-        if hasattr(YouTubeTranscriptApi, "get_transcript"):
-            raw = YouTubeTranscriptApi.get_transcript(vid, languages=langs)
-            return normalize_subs([{"text": clean_txt(s["text"]), "start": round(s["start"], 2), "duration": round(s["duration"], 2)} for s in raw if clean_txt(s.get("text", ""))])
-    except Exception:
-        pass
-    try:
-        if hasattr(YouTubeTranscriptApi, "list"):
-            t_list = YouTubeTranscriptApi().list(vid)
-            for tr in t_list:
-                fetched = tr.fetch()
-                return normalize_subs([{"text": clean_txt(s.text), "start": round(s.start, 2), "duration": round(s.duration, 2)} for s in fetched if clean_txt(s.text)])
-    except Exception:
-        pass
-    return []
-
-def w_ytdlp(vid: str):
-    try:
-        import yt_dlp
-        ydl_opts = {"skip_download": True, "quiet": True, "no_warnings": True, "writesubtitles": True, "writeautomaticsub": True, "subtitleslangs": ["en.*", "en"]}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
-            for key in ["subtitles", "automatic_captions"]:
-                sub_dict = info.get(key) or {}
-                for lang_k in sub_dict:
-                    if lang_k.startswith("en"):
-                        formats = sub_dict[lang_k]
-                        chosen = next((f for f in formats if f.get("ext") in ["json3", "srv1", "vtt"]), formats[0] if formats else None)
-                        if chosen and chosen.get("url"):
-                            r = safe_req("GET", chosen["url"], use_session=False, headers={"User-Agent": UA}, timeout=10)
-                            subs = parse_captions(r.text)
-                            if subs: return subs
-    except Exception:
-        pass
-    return []
-
-def w_piped_inv(vid: str):
-    for host in ["https://pipedapi.kavin.rocks", "https://api.piped.private.coffee", "https://pipedapi.leptons.xyz"]:
-        try:
-            r = safe_req("GET", f"{host}/streams/{vid}", timeout=8)
-            if r.status_code == 200 and r.json().get("subtitles"):
-                s_list = r.json()["subtitles"]
-                ch = next((x for x in s_list if x.get("code", "").startswith("en")), s_list[0])
-                if ch.get("url"):
-                    subs = parse_captions(safe_req("GET", ch["url"], timeout=8).text)
-                    if subs: return subs
-        except Exception: pass
-    for inv in ["https://inv.nadeko.net", "https://invidious.nerdvpn.de", "https://yewtu.be"]:
-        try:
-            r = safe_req("GET", f"{inv}/api/v1/captions/{vid}", timeout=8)
-            if r.status_code == 200 and r.json().get("captions"):
-                caps = r.json()["captions"]
-                ch = next((x for x in caps if x.get("language_code", "").startswith("en")), caps[0])
-                if ch.get("label"):
-                    subs = parse_captions(safe_req("GET", f"{inv}/api/v1/captions/{vid}", params={"label": ch["label"]}, timeout=8).text)
-                    if subs: return subs
-        except Exception: pass
+                subs = normalize_subs(subs)
+                if subs: return subs
     return []
 
 def fetch_youtube_subtitles(video_id: str) -> list[dict]:
     tasks = [
         lambda: w_innertube(video_id),
-        lambda: w_yttrans(video_id),
-        lambda: w_tactiq(video_id),
-        lambda: w_ytapi(video_id),
         lambda: w_ytdlp(video_id),
-        lambda: w_notegpt(video_id),
-        lambda: w_piped_inv(video_id)
+        lambda: w_ytapi(video_id),
+        lambda: w_tactiq(video_id),
+        lambda: w_notegpt(video_id)
     ]
-    ex = ThreadPoolExecutor(max_workers=7)
+    ex = ThreadPoolExecutor(max_workers=5)
     try:
         futures = [ex.submit(fn) for fn in tasks]
         for fut in as_completed(futures, timeout=22):
             try:
                 res = fut.result()
-                if res and len(res) > 0:
+                if is_valid_subs(res):
                     ex.shutdown(wait=False, cancel_futures=True)
                     return res
             except Exception:
@@ -418,7 +388,6 @@ def translate_batch_list(texts: list[str], batch_size: int = 35) -> list[str]:
 def prepare_initial_subs(vid: str, raw_subs: list[dict]):
     subs = raw_subs[:3500]
     for s in subs: s["text"] = clean_txt(s.get("text", "")) or "..."
-    # Chỉ dịch nhanh 20 câu đầu (~0.8s) để mở video tức thì, phần còn lại dịch ngầm
     init_n = min(20, len(subs))
     init_vi = translate_batch_list([subs[i]["text"] for i in range(init_n)], batch_size=20)
     for i, s in enumerate(subs):
@@ -449,7 +418,8 @@ async def process_video(req: VideoRequest):
 
 @app.post("/api/process-raw-subtitles")
 async def process_raw_subtitles(req: RawSubsRequest):
-    if not req.subtitles: return {"error": "Video này không có phụ đề tiếng Anh."}
+    if not is_valid_subs(req.subtitles):
+        return {"error": "Video này không có phụ đề tiếng Anh."}
     return prepare_initial_subs(req.video_id, req.subtitles)
 
 @app.post("/api/translate-batch")
@@ -609,6 +579,13 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       processUrlOrId("https://www.youtube.com/watch?v=gedoSfZvBgE");
     }
 
+    function isValidSubsJS(arr) {
+      if (!arr || !arr.length) return false;
+      const joined = arr.slice(0, 5).map(x => (x.text || "").toLowerCase()).join(" ");
+      if (joined.includes("blocking us from fetching") || joined.includes("working on a fix") || joined.includes("generating a summary")) return false;
+      return true;
+    }
+
     function normalizeSubsJS(arr) {
       const cleaned = [];
       for (const item of arr) {
@@ -622,7 +599,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           cleaned[i].duration = Math.max(+(cleaned[i+1].start - cleaned[i].start).toFixed(2), 1.0);
         }
       }
-      return cleaned;
+      return isValidSubsJS(cleaned) ? cleaned : [];
     }
 
     function decodeHtmlEntities(str) {
@@ -637,8 +614,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       const c = str.trim();
       if (c.startsWith("{")) {
         try {
-          const parsed = JSON.parse(c);
-          const evs = parsed.events || (parsed.contents ? JSON.parse(parsed.contents).events : []) || [];
+          let parsed = JSON.parse(c);
+          if (parsed.contents && typeof parsed.contents === "string") parsed = JSON.parse(parsed.contents);
+          const evs = parsed.events || [];
           for (const ev of evs) {
             if (ev.aAppend === 1) continue;
             const txt = (ev.segs || []).map(s => s.utf8 || "").join("").split("\n").join(" ").trim();
@@ -675,81 +653,70 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     }
 
     async function fetchFromPhoneBrowser(vid) {
-      const getProxies = [
-        u => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u),
-        u => "https://api.cors.lol/?url=" + encodeURIComponent(u),
-        u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u)
+      const clients = [
+        {clientName: "ANDROID_VR", clientVersion: "1.61.48", androidSdkVersion: 32, hl: "en", gl: "US"},
+        {clientName: "ANDROID", clientVersion: "20.10.38", androidSdkVersion: 30, hl: "en", gl: "US"},
+        {clientName: "IOS", clientVersion: "20.10.4", hl: "en", gl: "US"}
       ];
 
-      // 1. Lấy nhanh qua YouTubeTranscript XML Server (GET nhẹ, không dính exp=xpe)
-      const ytTransUrl = "https://youtubetranscript.com/?server_vid2=" + vid;
-      for (const px of getProxies) {
-        try {
-          const r = await fetch(px(ytTransUrl));
-          if (r.ok) {
-            const subs = parseCapData(await r.text());
-            if (subs.length) return subs;
-          }
-        } catch(e) {}
-      }
-
-      // 2. Gọi InnerTube ANDROID 20.10.38 qua Proxy hỗ trợ POST & xóa &fmt=srv3 trước khi gắn &fmt=json3
-      const postProxies = [
-        "https://api.cors.lol/?url=" + encodeURIComponent("https://www.youtube.com/youtubei/v1/player?prettyPrint=false"),
-        "https://thingproxy.freeboard.io/fetch/https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+      // 1. Gọi InnerTube qua Proxy đồng bộ IP (dùng text/plain để tránh lỗi CORS OPTIONS Preflight trên iPhone)
+      const proxyPairs = [
+        {
+          postUrl: "https://api.cors.lol/?url=" + encodeURIComponent("https://www.youtube.com/youtubei/v1/player?prettyPrint=false"),
+          getWrap: u => "https://api.cors.lol/?url=" + encodeURIComponent(u)
+        },
+        {
+          postUrl: "https://thingproxy.freeboard.io/fetch/https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+          getWrap: u => "https://thingproxy.freeboard.io/fetch/" + u
+        }
       ];
-      for (const ep of postProxies) {
-        try {
-          const rIn = await fetch(ep, {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({
-              videoId: vid,
-              context: {client: {clientName: "ANDROID", clientVersion: "20.10.38", androidSdkVersion: 30, hl: "en", gl: "US"}}
-            })
-          });
-          if (rIn.ok) {
-            const dIn = await rIn.json();
-            const tracks = (((dIn.captions || {}).playerCaptionsTracklistRenderer || {}).captionTracks) || [];
-            const tr = tracks.find(x => (x.languageCode || "").startsWith("en")) || tracks[0];
-            if (tr && tr.baseUrl) {
-              const cleanBase = tr.baseUrl.replace(/&fmt=[^&]+/g, "");
-              for (const px of getProxies) {
-                try {
-                  const rSub = await fetch(px(cleanBase + "&fmt=json3"));
-                  let subs = parseCapData(await rSub.text());
-                  if (!subs.length) {
-                    const rSub2 = await fetch(px(cleanBase));
-                    subs = parseCapData(await rSub2.text());
-                  }
-                  if (subs.length) return subs;
-                } catch(e) {}
+
+      for (const pair of proxyPairs) {
+        for (const cl of clients) {
+          try {
+            const rIn = await fetch(pair.postUrl, {
+              method: "POST",
+              headers: {"Content-Type": "text/plain;charset=UTF-8"},
+              body: JSON.stringify({videoId: vid, context: {client: cl}})
+            });
+            if (rIn.ok) {
+              const dIn = await rIn.json();
+              const tracks = (((dIn.captions || {}).playerCaptionsTracklistRenderer || {}).captionTracks) || [];
+              const tr = tracks.find(x => (x.languageCode || "").startsWith("en")) || tracks[0];
+              if (tr && tr.baseUrl && !tr.baseUrl.includes("exp=xpe")) {
+                const cleanBase = tr.baseUrl.replace(/&fmt=[^&]+/g, "");
+                for (const suffix of ["&fmt=json3", "&fmt=srv1", ""]) {
+                  try {
+                    const rSub = await fetch(pair.getWrap(cleanBase + suffix));
+                    const subs = parseCapData(await rSub.text());
+                    if (subs.length) return subs;
+                  } catch(e) {}
+                }
               }
             }
-          }
-        } catch(e) {}
+          } catch(e) {}
+        }
       }
 
-      // 3. Gọi Tactiq qua Proxy & trực tiếp
-      for (const tUrl of ["https://tactiq-apps-prod.tactiq.io/transcript", "https://api.cors.lol/?url=https://tactiq-apps-prod.tactiq.io/transcript"]) {
-        try {
-          const rT = await fetch(tUrl, {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({videoUrl: "https://www.youtube.com/watch?v=" + vid, langCode: "en"})
-          });
-          if (rT.ok) {
-            const dT = await rT.json();
-            if (dT.captions && dT.captions.length) {
-              return normalizeSubsJS(dT.captions.map(c => ({
-                text: (c.text || "").replace(/\n/g, " ").trim(),
-                start: +(parseFloat(c.start || 0)).toFixed(2),
-                duration: +(parseFloat(c.dur || 2.5)).toFixed(2)
-              })).filter(x => x.text));
-            }
+      // 2. Dự phòng gọi Tactiq qua Proxy
+      try {
+        const rT = await fetch("https://api.cors.lol/?url=" + encodeURIComponent("https://tactiq-apps-prod.tactiq.io/transcript"), {
+          method: "POST",
+          headers: {"Content-Type": "text/plain;charset=UTF-8"},
+          body: JSON.stringify({videoUrl: "https://www.youtube.com/watch?v=" + vid, langCode: "en"})
+        });
+        if (rT.ok) {
+          const dT = await rT.json();
+          if (dT.captions && dT.captions.length) {
+            const subs = normalizeSubsJS(dT.captions.map(c => ({
+              text: (c.text || "").replace(/\n/g, " ").trim(),
+              start: +(parseFloat(c.start || 0)).toFixed(2),
+              duration: +(parseFloat(c.dur || 2.5)).toFixed(2)
+            })).filter(x => x.text));
+            if (subs.length) return subs;
           }
-        } catch(e) {}
-      }
+        }
+      } catch(e) {}
 
       return [];
     }
