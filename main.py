@@ -1,4 +1,4 @@
-import re, json, html, socket, base64, urllib.parse, urllib3, requests
+import re, json, html, socket, base64, sys, subprocess, threading, urllib.parse, urllib3, requests
 import urllib3.util.connection as urllib3_conn
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, Query
@@ -13,8 +13,17 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+def _bg_upgrade_tools():
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "--upgrade", "youtube-transcript-api", "yt-dlp"], timeout=60)
+    except Exception:
+        pass
+
+threading.Thread(target=_bg_upgrade_tools, daemon=True).start()
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 ANDROID_UA = "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip"
+IOS_UA = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)"
 WEB_CLIENT_VERSION = "2.20260115.01.00"
 
 class VideoRequest(BaseModel):
@@ -45,8 +54,9 @@ def extract_youtube_id(url: str):
     m = re.search(r"(?:v=|youtu\.be\/|embed\/|shorts\/|live\/|\/v\/)([0-9A-Za-z_-]{11})", u)
     if m:
         return m.group(1)
-    m2 = re.search(r"(?:^|[^0-9A-Za-z_-])([0-9A-Za-z_-]{11})(?:$|[^0-9A-Za-z_-])", u)
-    return m2.group(1) if m2 else None
+    if re.fullmatch(r"[0-9A-Za-z_-]{11}", u):
+        return u
+    return None
 
 def safe_req(method: str, url: str, **kw):
     kw.setdefault("timeout", 9)
@@ -55,6 +65,100 @@ def safe_req(method: str, url: str, **kw):
     except Exception:
         kw["verify"] = False
         return requests.request(method, url, **kw)
+
+def resolve_universal_url(raw_url: str) -> dict:
+    """
+    Giải mã mọi loại đường dẫn:
+    - Link rút gọn (link.z-waka.com, bit.ly, tinyurl, t.co...)
+    - Link YouTube (watch, live, shorts, youtu.be)
+    - Link phòng họp trực tiếp (Zoom, Google Meet, Microsoft Teams, Webex, Z-Waka)
+    - Link video trực tiếp (.mp4, .m3u8) hoặc trang web có nhúng video
+    """
+    u = (raw_url or "").strip()
+    if not u:
+        return {"type": "invalid"}
+    if not u.startswith(("http://", "https://")):
+        vid = extract_youtube_id(u)
+        if vid:
+            return {"type": "youtube", "video_id": vid, "url": f"https://www.youtube.com/watch?v={vid}", "title": ""}
+        u = "https://" + u
+
+    vid = extract_youtube_id(u)
+    if vid:
+        return {"type": "youtube", "video_id": vid, "url": f"https://www.youtube.com/watch?v={vid}", "title": ""}
+
+    final_url = u
+    page_title = ""
+    page_html = ""
+
+    # Đi theo chuỗi Redirect (301/302) để giải mã link rút gọn như link.z-waka.com
+    try:
+        r = safe_req("GET", u, headers={"User-Agent": UA}, allow_redirects=True, timeout=8, stream=True)
+        final_url = r.url or u
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "text/html" in ctype:
+            raw_bytes = b""
+            for chunk in r.iter_content(chunk_size=16384):
+                raw_bytes += chunk
+                if len(raw_bytes) > 131072:
+                    break
+            page_html = raw_bytes.decode("utf-8", errors="ignore")
+        r.close()
+    except Exception:
+        pass
+
+    # Kiểm tra xem URL sau khi chuyển hướng có phải là YouTube không
+    vid_after = extract_youtube_id(final_url)
+    if vid_after:
+        return {"type": "youtube", "video_id": vid_after, "url": f"https://www.youtube.com/watch?v={vid_after}", "title": ""}
+
+    # Kiểm tra meta refresh hoặc iframe YouTube nhúng bên trong trang đích (ví dụ trang sự kiện z-waka)
+    if page_html:
+        m_title = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.I | re.S)
+        if m_title:
+            page_title = re.sub(r"\s+", " ", html.unescape(m_title.group(1))).strip()
+
+        m_refresh = re.search(r'url=([^"\'>\s]+)', page_html, re.I)
+        if m_refresh:
+            ref_u = html.unescape(m_refresh.group(1))
+            vid_ref = extract_youtube_id(ref_u)
+            if vid_ref:
+                return {"type": "youtube", "video_id": vid_ref, "url": f"https://www.youtube.com/watch?v={vid_ref}", "title": page_title}
+            if ref_u.startswith("http"):
+                final_url = ref_u
+
+        m_yt_embed = re.search(r'(?:youtube\.com/embed/|youtube\.com/watch\?v=|youtu\.be/)([0-9A-Za-z_-]{11})', page_html)
+        if m_yt_embed:
+            vid_emb = m_yt_embed.group(1)
+            return {"type": "youtube", "video_id": vid_emb, "url": f"https://www.youtube.com/watch?v={vid_emb}", "title": page_title}
+
+        m_media = re.search(r'(https?://[^\s"\'<>]+\.(?:m3u8|mp4)(?:\?[^\s"\'<>]+)?)', page_html, re.I)
+        if m_media:
+            return {"type": "direct_media", "video_id": "media_stream", "url": m_media.group(1), "orig_url": final_url, "title": page_title or "ồng phát Video trực tiếp"}
+
+    low_u = final_url.lower()
+    if any(k in low_u for k in [".mp4", ".m3u8", ".webm"]):
+        return {"type": "direct_media", "video_id": "media_stream", "url": final_url, "orig_url": final_url, "title": page_title or "Video trực tiếp"}
+
+    platform_name = "Phòng Họp / Livestream Trực Tiếp"
+    if "zoom.us" in low_u:
+        platform_name = "Zoom Webinar / Meeting Trực Tiếp"
+    elif "meet.google.com" in low_u:
+        platform_name = "Google Meet Trực Tiếp"
+    elif "teams.microsoft.com" in low_u or "teams.live.com" in low_u:
+        platform_name = "Microsoft Teams Trực Tiếp"
+    elif "z-waka.com" in low_u:
+        platform_name = "Hội Thảo Y Khoa Z-Waka"
+    elif "webex.com" in low_u:
+        platform_name = "Cisco Webex Webinar"
+
+    return {
+        "type": "external_live",
+        "video_id": "live_" + str(abs(hash(final_url)) % 1000000),
+        "url": final_url,
+        "platform": platform_name,
+        "title": page_title or platform_name
+    }
 
 def clean_txt(raw: str) -> str:
     t = re.sub(r"<[^>]+>", " ", html.unescape(raw or "")).replace("\n", " ").strip()
@@ -123,7 +227,7 @@ def fetch_video_title(vid: str, custom_title: str = "") -> str:
                 return r.json()["title"]
         except Exception:
             pass
-    return f"Video ({vid})"
+    return f"Bài giảng Video ({vid})"
 
 def with_format(url: str, fmt: str = "json3") -> str:
     parts = urllib.parse.urlsplit(url)
@@ -142,14 +246,26 @@ def _pb_str(field_no: int, val: str) -> bytes:
     len_bytes.append(length & 0x7F)
     return bytes([tag]) + bytes(len_bytes) + b
 
-def build_get_transcript_params(video_id: str, kind: str = "asr", lang: str = "en") -> str:
+def build_get_transcript_params(video_id: str, kind: str = "asr", lang: str = "en", url_encode_inner: bool = True) -> str:
+    """
+    Chuẩn Protobuf 8 trường đầy đủ của YouTube Transcript API (Bao gồm trường 6=1, 7=1, 8=1):
+    Field 1: video_id
+    Field 2: base64(Field 1: kind, Field 2: lang, Field 3: "")
+    Field 3: varint 1 (\x18\x01)
+    Field 5: "engagement-panel-searchable-transcript-search-panel"
+    Field 6: varint 1 (\x30\x01)
+    Field 7: varint 1 (\x38\x01)
+    Field 8: varint 1 (\x40\x01)
+    """
     inner = _pb_str(1, kind) + _pb_str(2, lang) + _pb_str(3, "")
-    inner_b64 = urllib.parse.quote(base64.b64encode(inner).decode("ascii"))
+    raw_b64 = base64.b64encode(inner).decode("ascii")
+    inner_str = urllib.parse.quote(raw_b64) if url_encode_inner else raw_b64
     outer = (
         _pb_str(1, video_id)
-        + _pb_str(2, inner_b64)
-        + bytes([(3 << 3) | 0, 1])
+        + _pb_str(2, inner_str)
+        + b"\x18\x01"
         + _pb_str(5, "engagement-panel-searchable-transcript-search-panel")
+        + b"\x30\x01\x38\x01\x40\x01"
     )
     return base64.b64encode(outer).decode("ascii")
 
@@ -242,24 +358,99 @@ def parse_captions(content: str) -> list[dict]:
     return normalize_subs(res)
 
 # ==============================================================================
-# 7 LUỒNG TRÍCH XUẤT CHẠY SONG SONG (VƯỢT TƯỜNG LỬA CHO CẢ LOCAL & RENDER CLOUD)
+# CÁC LUỒNG TRÍCH XUẤT PHỤ ĐỀ VƯỢT TƯỜNG LỬA CHO CẢ RENDER CLOUD & MOBILE 4G
 # ==============================================================================
 
-def w_android_single_session(vid: str) -> list[dict]:
-    clients = [
-        {"clientName": "ANDROID", "clientVersion": "20.10.38", "hl": "en", "gl": "US"},
-        {"clientName": "IOS", "clientVersion": "20.10.4", "hl": "en", "gl": "US"},
-        {"clientName": "ANDROID_VR", "clientVersion": "1.61.48", "androidSdkVersion": 32, "hl": "en", "gl": "US"}
+def w_get_transcript_panel(vid: str) -> list[dict]:
+    """Luồng 1: Gọi cổng /youtubei/v1/get_transcript với Protobuf 8 trường đầy đủ (Không bị khóa bởi sparams=ip)"""
+    params_list = [
+        build_get_transcript_params(vid, kind="asr", lang="en", url_encode_inner=True),
+        build_get_transcript_params(vid, kind="", lang="en", url_encode_inner=True),
+        build_get_transcript_params(vid, kind="asr", lang="en", url_encode_inner=False),
+        build_get_transcript_params(vid, kind="", lang="en", url_encode_inner=False)
     ]
-    for cl in clients:
+    clients = [
+        ("WEB", WEB_CLIENT_VERSION, UA),
+        ("MWEB", "2.20260115.01.00", "Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1")
+    ]
+    endpoints = [
+        "https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false",
+        "https://m.youtube.com/youtubei/v1/get_transcript?prettyPrint=false",
+        "https://api.cors.lol/?url=" + urllib.parse.quote("https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false", safe="")
+    ]
+    for ep in endpoints:
+        for c_name, c_ver, c_ua in clients:
+            for p_val in params_list:
+                try:
+                    payload = {
+                        "context": {"client": {"clientName": c_name, "clientVersion": c_ver, "hl": "en", "gl": "US"}},
+                        "params": p_val
+                    }
+                    r = safe_req("POST", ep, json=payload, headers={"User-Agent": c_ua, "Content-Type": "application/json", "Origin": "https://www.youtube.com"}, timeout=8)
+                    if r.status_code == 200 and "transcriptSegmentRenderer" in r.text:
+                        subs = parse_get_transcript_json(r.json())
+                        if subs:
+                            return subs
+                except Exception:
+                    pass
+    return []
+
+def w_google_translate_proxy_synced(vid: str) -> list[dict]:
+    """
+    Luồng 2: Đi xuyên qua Google Translate Proxy cho CẢ 2 BƯỚC (Watch + Timedtext)
+    để IP tải phụ đề trùng khớp 100% với IP của Google đã ký trong sparams=ip!
+    """
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA})
+    gt_watch = f"https://www-youtube-com.translate.goog/watch?v={vid}&hl=en&_x_tr_sl=es&_x_tr_tl=en&_x_tr_hl=en"
+    try:
+        r = s.get(gt_watch, timeout=10)
+        if r.status_code == 200:
+            # Nếu lấy được getTranscriptEndpoint.params từ trang Watch thì gọi get_transcript ngay
+            for m_p in re.finditer(r'"getTranscriptEndpoint"\s*:\s*\{\s*"params"\s*:\s*"([^"]+)"', r.text):
+                p_raw = urllib.parse.unquote(m_p.group(1))
+                r_gt = s.post(
+                    "https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false",
+                    json={"context": {"client": {"clientName": "WEB", "clientVersion": WEB_CLIENT_VERSION, "hl": "en", "gl": "US"}}, "params": p_raw},
+                    timeout=8
+                )
+                if r_gt.status_code == 200:
+                    subs = parse_get_transcript_json(r_gt.json())
+                    if subs:
+                        s.close()
+                        return subs
+
+            # Bóc baseUrl và định tuyến lại qua www-youtube-com.translate.goog để giữ nguyên IP của Google
+            urls = re.findall(r'"baseUrl"\s*:\s*"(https://www\.youtube\.com/api/timedtext[^"]+)"', r.text)
+            for raw_u in urls:
+                clean_u = raw_u.replace("\\u0026", "&").replace("\\/", "/").replace("&fmt=srv3", "")
+                if "exp=xpe" not in clean_u:
+                    proxied_timedtext = clean_u.replace("https://www.youtube.com/api/timedtext", "https://www-youtube-com.translate.goog/api/timedtext")
+                    proxied_timedtext += "&_x_tr_sl=es&_x_tr_tl=en&_x_tr_hl=en"
+                    for fmt_try in [with_format(proxied_timedtext, "json3"), proxied_timedtext]:
+                        r_sub = s.get(fmt_try, timeout=9)
+                        if r_sub.status_code == 200 and r_sub.text.strip():
+                            subs = parse_captions(r_sub.text)
+                            if subs:
+                                s.close()
+                                return subs
+    except Exception:
+        pass
+    s.close()
+    return []
+
+def w_android_single_session(vid: str) -> list[dict]:
+    """Luồng 3: Giả lập ứng dụng ANDROID / IOS / ANDROID_VR trên cùng 1 Session IPv4"""
+    clients = [
+        ({"clientName": "ANDROID", "clientVersion": "20.10.38", "hl": "en", "gl": "US"}, ANDROID_UA),
+        ({"clientName": "IOS", "clientVersion": "20.10.4", "hl": "en", "gl": "US"}, IOS_UA),
+        ({"clientName": "ANDROID_VR", "clientVersion": "1.61.48", "androidSdkVersion": 32, "hl": "en", "gl": "US"}, ANDROID_UA)
+    ]
+    for cl, c_ua in clients:
         s = requests.Session()
-        s.headers.update({"User-Agent": ANDROID_UA, "Accept-Language": "en-US,en;q=0.9"})
+        s.headers.update({"User-Agent": c_ua, "Accept-Language": "en-US,en;q=0.9"})
         try:
-            r = s.post(
-                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
-                json={"context": {"client": cl}, "videoId": vid},
-                timeout=8
-            )
+            r = s.post("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", json={"context": {"client": cl}, "videoId": vid}, timeout=8)
             if r.status_code == 200:
                 tracks = r.json().get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
                 if tracks:
@@ -268,21 +459,49 @@ def w_android_single_session(vid: str) -> list[dict]:
                         tr = next((x for x in tracks if x.get("languageCode", "").startswith("en")), tracks[0])
                     base_url = tr.get("baseUrl", "").replace("\\u0026", "&").replace("\\/", "/")
                     if base_url and "exp=xpe" not in base_url:
-                        json3_url = with_format(base_url, "json3")
-                        r_sub = s.get(json3_url, timeout=8)
-                        if r_sub.status_code == 200 and r_sub.text.strip():
-                            subs = parse_captions(r_sub.text)
-                            if subs:
-                                return subs
-                        r_xml = s.get(base_url.replace("&fmt=srv3", ""), timeout=8)
-                        if r_xml.status_code == 200 and r_xml.text.strip():
-                            subs = parse_captions(r_xml.text)
-                            if subs:
-                                return subs
+                        for target in [with_format(base_url, "json3"), base_url.replace("&fmt=srv3", "")]:
+                            r_sub = s.get(target, timeout=8)
+                            if r_sub.status_code == 200 and r_sub.text.strip():
+                                subs = parse_captions(r_sub.text)
+                                if subs:
+                                    s.close()
+                                    return subs
         except Exception:
             pass
         finally:
             s.close()
+    return []
+
+def w_ytdlp_universal(url_or_vid: str) -> list[dict]:
+    """Luồng 4: Dùng yt-dlp trích xuất phụ đề cho cả YouTube và các nền tảng video khác"""
+    target_url = f"https://www.youtube.com/watch?v={url_or_vid}" if re.fullmatch(r"[0-9A-Za-z_-]{11}", url_or_vid) else url_or_vid
+    try:
+        import yt_dlp
+        ydl_opts = {
+            "skip_download": True,
+            "quiet": True,
+            "no_warnings": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": ["en.*", "en", "vi"],
+            "extractor_args": {"youtube": {"player_client": ["ios", "android_vr", "mweb", "tv_embedded"]}}
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(target_url, download=False)
+            for key in ["subtitles", "automatic_captions"]:
+                sub_dict = info.get(key) or {}
+                for lang_k in sub_dict:
+                    if lang_k.startswith(("en", "vi")):
+                        formats = sub_dict[lang_k]
+                        for fmt_ext in ["json3", "srv1", "vtt", "ttml"]:
+                            chosen = next((f for f in formats if f.get("ext") == fmt_ext), None)
+                            if chosen and chosen.get("url") and "exp=xpe" not in chosen["url"]:
+                                r = safe_req("GET", chosen["url"], headers={"User-Agent": UA}, timeout=9)
+                                subs = parse_captions(r.text)
+                                if subs:
+                                    return subs
+    except Exception:
+        pass
     return []
 
 def w_ytapi(vid: str) -> list[dict]:
@@ -314,7 +533,6 @@ def w_ytapi(vid: str) -> list[dict]:
     return []
 
 def w_tactiq_direct(vid: str) -> list[dict]:
-    """Luồng độc lập 3: Gọi Tactiq (hiệu quả cao trên Cloud IP)"""
     for lc in ["en", "en-US", "en-GB"]:
         try:
             r = safe_req("POST", "https://tactiq-apps-prod.tactiq.io/transcript",
@@ -330,7 +548,6 @@ def w_tactiq_direct(vid: str) -> list[dict]:
     return []
 
 def w_notegpt_direct(vid: str) -> list[dict]:
-    """Luồng độc lập 4: Gọi NoteGPT trực tiếp & qua Proxy"""
     urls = [
         f"https://notegpt.io/api/v2/video-transcript?platform=youtube&video_id={vid}",
         f"https://api.codetabs.com/v1/proxy?quest={urllib.parse.quote(f'https://notegpt.io/api/v2/video-transcript?platform=youtube&video_id={vid}', safe='')}"
@@ -357,90 +574,42 @@ def w_notegpt_direct(vid: str) -> list[dict]:
             pass
     return []
 
-def w_google_translate_proxy(vid: str) -> list[dict]:
-    """Luồng độc lập 5: Đi xuyên qua Google Translate Web Proxy (Dùng IP nội bộ của Google để lấy trang Watch)"""
-    gt_url = f"https://www-youtube-com.translate.goog/watch?v={vid}&hl=en&_x_tr_sl=es&_x_tr_tl=en&_x_tr_hl=en"
+def w_proxy_watch_synced(vid: str, proxy_tpl: str) -> list[dict]:
+    """Lấy trang Watch và tải Timedtext qua CÙNG MỘT PROXY để giữ nguyên địa chỉ IP trong sparams=ip"""
+    w_url = f"https://www.youtube.com/watch?v={vid}&hl=en"
     try:
-        r = safe_req("GET", gt_url, headers={"User-Agent": UA}, timeout=10)
-        if r.status_code == 200 and '"captionTracks":' in r.text:
-            urls = re.findall(r'"baseUrl"\s*:\s*"(https://www\.youtube\.com/api/timedtext[^"]+)"', r.text)
+        r1 = safe_req("GET", proxy_tpl.format(urllib.parse.quote(w_url, safe="")), headers={"User-Agent": UA}, timeout=10)
+        if r1.status_code == 200 and '"captionTracks":' in r1.text:
+            urls = re.findall(r'"baseUrl"\s*:\s*"(https://www\.youtube\.com/api/timedtext[^"]+)"', r1.text)
             for raw_u in urls:
                 clean_u = raw_u.replace("\\u0026", "&").replace("\\/", "/").replace("&fmt=srv3", "")
                 if "exp=xpe" not in clean_u:
-                    r_sub = safe_req("GET", with_format(clean_u, "json3"), headers={"User-Agent": UA}, timeout=8)
-                    subs = parse_captions(r_sub.text)
-                    if subs:
-                        return subs
+                    for target_u in [with_format(clean_u, "json3"), clean_u]:
+                        r2 = safe_req("GET", proxy_tpl.format(urllib.parse.quote(target_u, safe="")), headers={"User-Agent": UA}, timeout=10)
+                        if r2.status_code == 200 and r2.text.strip():
+                            subs = parse_captions(r2.text)
+                            if subs:
+                                return subs
     except Exception:
         pass
     return []
 
-def w_get_transcript_panel(vid: str) -> list[dict]:
-    """Luồng độc lập 6: Cổng /youtubei/v1/get_transcript trực tiếp & qua Proxy"""
-    params_candidates = [
-        build_get_transcript_params(vid, kind="asr", lang="en"),
-        build_get_transcript_params(vid, kind="", lang="en")
-    ]
-    endpoints = [
-        "https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false",
-        "https://api.cors.lol/?url=" + urllib.parse.quote("https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false", safe="")
-    ]
-    for ep in endpoints:
-        for p_val in params_candidates:
-            try:
-                client_ctx = {"clientName": "WEB", "clientVersion": WEB_CLIENT_VERSION, "hl": "en", "gl": "US"}
-                r = safe_req("POST", ep, json={"context": {"client": client_ctx}, "params": p_val},
-                             headers={"Origin": "https://www.youtube.com", "Content-Type": "application/json", "User-Agent": UA}, timeout=9)
-                if r.status_code == 200:
-                    subs = parse_get_transcript_json(r.json())
-                    if subs:
-                        return subs
-            except Exception:
-                pass
-    return []
-
-def w_invidious_piped(vid: str) -> list[dict]:
-    """Luồng độc lập 7: Hệ thống máy chủ Piped & Invidious quốc tế"""
-    for host in ["https://pipedapi.kavin.rocks", "https://api.piped.private.coffee", "https://pipedapi.tokhmi.xyz"]:
-        try:
-            r = safe_req("GET", f"{host}/streams/{vid}", timeout=7)
-            if r.status_code == 200 and r.json().get("subtitles"):
-                s_list = r.json()["subtitles"]
-                ch = next((x for x in s_list if x.get("code", "").startswith("en")), s_list[0])
-                if ch.get("url"):
-                    subs = parse_captions(safe_req("GET", ch["url"], timeout=7).text)
-                    if subs:
-                        return subs
-        except Exception:
-            pass
-    for inv in ["https://inv.nadeko.net", "https://invidious.nerdvpn.de", "https://yewtu.be"]:
-        try:
-            r = safe_req("GET", f"{inv}/api/v1/captions/{vid}", timeout=7)
-            if r.status_code == 200 and r.json().get("captions"):
-                caps = r.json()["captions"]
-                ch = next((x for x in caps if x.get("language_code", "").startswith("en")), caps[0])
-                if ch.get("label"):
-                    subs = parse_captions(safe_req("GET", f"{inv}/api/v1/captions/{vid}", params={"label": ch["label"]}, timeout=7).text)
-                    if subs:
-                        return subs
-        except Exception:
-            pass
-    return []
-
 def fetch_youtube_subtitles(video_id: str) -> list[dict]:
     tasks = [
+        lambda: w_get_transcript_panel(video_id),
+        lambda: w_google_translate_proxy_synced(video_id),
         lambda: w_android_single_session(video_id),
         lambda: w_ytapi(video_id),
+        lambda: w_ytdlp_universal(video_id),
         lambda: w_tactiq_direct(video_id),
         lambda: w_notegpt_direct(video_id),
-        lambda: w_google_translate_proxy(video_id),
-        lambda: w_get_transcript_panel(video_id),
-        lambda: w_invidious_piped(video_id)
+        lambda: w_proxy_watch_synced(video_id, "https://api.codetabs.com/v1/proxy?quest={}"),
+        lambda: w_proxy_watch_synced(video_id, "https://api.allorigins.win/raw?url={}")
     ]
-    ex = ThreadPoolExecutor(max_workers=7)
+    ex = ThreadPoolExecutor(max_workers=9)
     try:
         futures = [ex.submit(fn) for fn in tasks]
-        for fut in as_completed(futures, timeout=15):
+        for fut in as_completed(futures, timeout=16):
             try:
                 res = fut.result()
                 if is_valid_subs(res):
@@ -491,7 +660,7 @@ def translate_batch_list(texts: list[str], batch_size: int = 35, tl: str = "vi")
             out.append(val if val else translate_single(orig, tl=tl))
     return out
 
-def prepare_initial_subs(vid: str, raw_subs: list[dict], title: str, target_lang: str = "vi"):
+def prepare_initial_subs(vid: str, raw_subs: list[dict], title: str, target_lang: str = "vi", source_type: str = "youtube", media_url: str = ""):
     subs = raw_subs[:3500]
     for s in subs:
         s["text"] = clean_txt(s.get("text", "")) or "..."
@@ -501,7 +670,9 @@ def prepare_initial_subs(vid: str, raw_subs: list[dict], title: str, target_lang
         s["vi"] = init_vi[i] if i < init_n else "⏳ Đang dịch..."
         s["translated"] = (i < init_n)
     return {
+        "source_type": source_type,
         "video_id": vid,
+        "media_url": media_url,
         "title": title,
         "subtitles": subs
     }
@@ -521,21 +692,56 @@ async def tts(text: str = Query(..., max_length=500), tl: str = Query("vi")):
 
 @app.post("/api/process-video")
 async def process_video(req: VideoRequest):
-    vid = extract_youtube_id(req.url)
-    if not vid:
-        return {"error": "Link YouTube không hợp lệ!"}
-    title = fetch_video_title(vid, req.custom_title)
-    try:
-        subs = fetch_youtube_subtitles(vid)
-        return prepare_initial_subs(vid, subs, title, req.target_lang)
-    except Exception:
+    resolved = resolve_universal_url(req.url)
+    if resolved["type"] == "invalid":
+        return {"error": "Bạn hãy dán một đường dẫn hợp lệ vào ô URL nhé!"}
+
+    # Trường hợp 1: Link dẫn tới YouTube (Bao gồm cả link rút gọn z-waka/bit.ly trỏ về YouTube)
+    if resolved["type"] == "youtube":
+        vid = resolved["video_id"]
+        title = fetch_video_title(vid, req.custom_title or resolved.get("title", ""))
+        try:
+            subs = fetch_youtube_subtitles(vid)
+            return prepare_initial_subs(vid, subs, title, req.target_lang, source_type="youtube", media_url=resolved["url"])
+        except Exception:
+            return {
+                "need_client_fetch": True,
+                "source_type": "youtube",
+                "video_id": vid,
+                "media_url": resolved["url"],
+                "title": title,
+                "pb_asr": build_get_transcript_params(vid, "asr", "en", True),
+                "pb_man": build_get_transcript_params(vid, "", "en", True),
+                "pb_asr_raw": build_get_transcript_params(vid, "asr", "en", False)
+            }
+
+    # Trường hợp 2: Link Video trực tiếp (.mp4, .m3u8) hoặc nền tảng khác
+    if resolved["type"] == "direct_media":
+        title = req.custom_title or resolved.get("title") or "Video Trực Tiếp"
+        subs = w_ytdlp_universal(resolved.get("orig_url") or resolved["url"])
+        if subs:
+            return prepare_initial_subs(resolved["video_id"], subs, title, req.target_lang, source_type="direct_media", media_url=resolved["url"])
         return {
-            "need_client_fetch": True,
-            "video_id": vid,
+            "source_type": "direct_media",
+            "video_id": resolved["video_id"],
+            "media_url": resolved["url"],
             "title": title,
-            "pb_asr": build_get_transcript_params(vid, "asr", "en"),
-            "pb_man": build_get_transcript_params(vid, "", "en")
+            "subtitles": []
         }
+
+    # Trường hợp 3: Link Zoom / Google Meet / Microsoft Teams / Hội thảo Z-Waka đang phát trực tiếp
+    title = req.custom_title or resolved.get("title") or resolved.get("platform") or "Phòng Họp Trực Tuyến"
+    subs = w_ytdlp_universal(resolved["url"])
+    if subs:
+        return prepare_initial_subs(resolved["video_id"], subs, title, req.target_lang, source_type="external_live", media_url=resolved["url"])
+    return {
+        "source_type": "external_live",
+        "video_id": resolved["video_id"],
+        "media_url": resolved["url"],
+        "platform": resolved.get("platform", "Phòng Họp / Livestream"),
+        "title": title,
+        "subtitles": []
+    }
 
 @app.post("/api/process-raw-subtitles")
 async def process_raw_subtitles(req: RawSubsRequest):
@@ -543,7 +749,7 @@ async def process_raw_subtitles(req: RawSubsRequest):
     if is_valid_subs(req.subtitles):
         return prepare_initial_subs(req.video_id, req.subtitles, title, req.target_lang)
     return {
-        "error": "Video này hiện bị khóa truy cập phụ đề từ máy chủ. Bạn hãy bấm nút '🎙️ AI Nghe Loa' để nghe và dịch trực tiếp theo thời gian thực nhé!"
+        "error": "Video này không mở phụ đề công khai hoặc đang phát trực tiếp. Bạn hãy bấm nút '🎙️ AI Nghe Loa' để nghe và dịch trực tiếp theo thời gian thực nhé!"
     }
 
 @app.post("/api/translate-batch")
@@ -592,7 +798,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>MedLingua AI Studio - Học Tiếng Anh Qua Video Thời Gian Thực</title>
+  <title>MedLingua AI Studio - Dịch Mọi Nguồn Video, Zoom, Meet, Teams & YouTube</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     .word-span { cursor: pointer; padding: 1px 4px; border-radius: 4px; display: inline-block; transition: all 0.12s; }
@@ -615,9 +821,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         <div>
           <h1 class="text-lg sm:text-xl font-bold text-blue-400 flex items-center gap-2 flex-wrap">
             MedLingua AI Studio
-            <span class="text-[11px] bg-emerald-500/20 text-emerald-400 px-2.5 py-0.5 rounded-full font-medium">Real-Time Speech • Dịch Cabin</span>
+            <span class="text-[11px] bg-emerald-500/20 text-emerald-400 px-2.5 py-0.5 rounded-full font-medium">YouTube • Zoom • Meet • Teams • Z-Waka</span>
           </h1>
-          <p class="text-xs text-slate-400">Dán link YouTube bất kỳ • Tự động trích xuất phụ đề hoặc AI Nghe Loa dịch tức thì theo thời gian thực</p>
+          <p class="text-xs text-slate-400">Hỗ trợ mọi đường dẫn Video & Phòng họp trực tuyến • Tự động lấy CC hoặc AI Nghe & Dịch Cabin thời gian thực</p>
         </div>
       </div>
       <div class="flex items-center gap-2">
@@ -629,25 +835,25 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     <!-- KHUNG NẠP BÀI GIẢNG & ĐIỀU KHIỂN CHÍNH -->
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-4 mb-4">
-      <!-- Cột trái: Nạp Video -->
+      <!-- Cột trái: Nạp Mọi Đường Dẫn -->
       <div class="lg:col-span-4 bg-slate-900 border border-slate-800 p-4 rounded-xl space-y-3 shadow-lg">
         <div class="flex items-center justify-between border-b border-slate-800 pb-2">
           <div class="flex items-center gap-2 text-red-400 font-bold text-sm">
             <span>▶️</span>
-            <span>Nạp Video Bài Giảng</span>
+            <span>Nạp Video / Phòng Họp Trực Tiếp</span>
           </div>
-          <span class="text-[10px] bg-blue-600/30 text-blue-300 px-2 py-0.5 rounded font-semibold">Real-Time Engine</span>
+          <span class="text-[10px] bg-blue-600/30 text-blue-300 px-2 py-0.5 rounded font-semibold">Mọi Nguồn Link</span>
         </div>
 
         <div>
-          <label class="block text-xs text-slate-300 font-medium mb-1">Tiêu đề bài giảng (bỏ trống để tự lấy tên từ YouTube):</label>
-          <input id="customTitle" type="text" placeholder="Nhập tên bài giảng (tùy chọn)..." class="w-full p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-white text-xs focus:border-blue-500 focus:outline-none">
+          <label class="block text-xs text-slate-300 font-medium mb-1">Tiêu đề bài giảng / Hội thảo (tùy chọn):</label>
+          <input id="customTitle" type="text" placeholder="Nhập tên bài giảng hoặc để trống tự lấy..." class="w-full p-2.5 rounded-lg bg-slate-950 border border-slate-700 text-white text-xs focus:border-blue-500 focus:outline-none">
         </div>
 
         <div>
-          <label class="block text-xs text-slate-300 font-medium mb-1">YouTube URL:</label>
+          <label class="block text-xs text-slate-300 font-medium mb-1">Đường dẫn (YouTube, Zoom, Meet, Teams, Z-Waka...):</label>
           <div class="relative">
-            <input id="videoUrl" type="text" placeholder="Dán link YouTube vào đây..." class="w-full p-2.5 pr-8 rounded-lg bg-slate-950 border border-slate-700 text-white text-xs focus:border-blue-500 focus:outline-none">
+            <input id="videoUrl" type="text" placeholder="Dán link YouTube, Zoom, Meet, Teams, z-waka..." class="w-full p-2.5 pr-8 rounded-lg bg-slate-950 border border-slate-700 text-white text-xs focus:border-blue-500 focus:outline-none">
             <button onclick="document.getElementById('videoUrl').value='';document.getElementById('videoUrl').focus();" class="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-xs px-1">✕</button>
           </div>
         </div>
@@ -656,7 +862,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           <div>
             <label class="block text-[11px] text-slate-400 mb-1">Ngôn ngữ bài giảng</label>
             <select id="sourceLang" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-slate-200">
-              <option value="en-US" selected>Tiếng Anh (English)</option>
+              <option value="en-US" selected>Tiếng Anh (US)</option>
               <option value="en-GB">Tiếng Anh (UK)</option>
             </select>
           </div>
@@ -671,7 +877,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
         <div class="flex gap-2 pt-1">
           <button onclick="analyzeVideo()" id="btnLoad" class="flex-1 bg-red-600 hover:bg-red-500 active:bg-red-700 text-white py-2.5 px-3 rounded-lg font-bold text-xs sm:text-sm transition flex items-center justify-center gap-1.5 shadow-lg">
-            🚀 Phân Tích & Dịch Phụ Đề
+            🚀 Mở Link & Dịch Phụ Đề
           </button>
         </div>
 
@@ -695,11 +901,11 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           <div class="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3 mb-3">
             <div class="min-w-0 flex-1">
               <div class="flex items-center gap-2 flex-wrap">
-                <h2 id="lectureTitleDisplay" class="text-base sm:text-lg font-bold text-white truncate">Chưa nạp video</h2>
+                <h2 id="lectureTitleDisplay" class="text-base sm:text-lg font-bold text-white truncate">Chưa nạp video / phòng họp</h2>
                 <button onclick="analyzeVideo()" class="bg-slate-800 hover:bg-slate-700 text-xs text-blue-300 px-2.5 py-1 rounded-md font-semibold shrink-0">🔄 Tải lại</button>
                 <button onclick="saveCurrentLecture()" class="bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 text-xs px-2.5 py-1 rounded-md font-semibold shrink-0">💾 Lưu bản dịch</button>
               </div>
-              <p id="lectureUrlDisplay" class="text-xs text-slate-400 font-mono mt-0.5 truncate">Hãy dán link YouTube vào ô bên trái để bắt đầu...</p>
+              <p id="lectureUrlDisplay" class="text-xs text-slate-400 font-mono mt-0.5 truncate">Dán bất kỳ link YouTube, Zoom, Meet, Teams hoặc Z-Waka vào ô bên trái...</p>
             </div>
             <span id="subCount" class="text-xs bg-slate-800 text-emerald-400 px-2.5 py-1 rounded-md font-semibold shrink-0">0 câu</span>
           </div>
@@ -756,13 +962,40 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- KHU VỰC HIỂN THỊ VIDEO & CÁC TAB CHỨC NĂNG -->
+    <!-- KHU VỰC HIỂN THỊ VIDEO / PHÒNG HỌP & CÁC TAB CHỨC NĂNG -->
     <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
-      <!-- Khung Trình phát Video YouTube -->
+      <!-- Khung Trình phát Đa Năng (YouTube / HTML5 Video / Live Meeting Studio) -->
       <div class="lg:col-span-7 space-y-3">
-        <div class="aspect-video bg-black rounded-xl overflow-hidden border border-slate-800 shadow-2xl">
-          <div id="player" class="w-full h-full flex items-center justify-center text-slate-500 text-xs">
-            Hãy dán link YouTube và bấm "🚀 Phân Tích & Dịch Phụ Đề"
+        <div class="aspect-video bg-black rounded-xl overflow-hidden border border-slate-800 shadow-2xl relative">
+          <!-- 1. Khung YouTube -->
+          <div id="ytWrapper" class="w-full h-full flex items-center justify-center text-slate-500 text-xs">
+            <div id="player" class="w-full h-full flex items-center justify-center text-center px-4">
+              Dán link YouTube, Zoom, Google Meet, Microsoft Teams hoặc Z-Waka và bấm "🚀 Mở Link & Dịch Phụ Đề"
+            </div>
+          </div>
+
+          <!-- 2. Khung Video Trực Tiếp (.mp4 / .m3u8 / Chia sẻ màn hình phòng họp) -->
+          <video id="html5Player" controls playsinline class="hidden w-full h-full bg-black object-contain"></video>
+
+          <!-- 3. Khung Phòng Họp Trực Tuyến (Zoom / Google Meet / Teams / Z-Waka) -->
+          <div id="liveMeetingOverlay" class="hidden absolute inset-0 bg-slate-950/95 flex flex-col items-center justify-center p-5 text-center space-y-3">
+            <div class="w-12 h-12 rounded-2xl bg-blue-500/20 border border-blue-500/40 flex items-center justify-center text-2xl">📡</div>
+            <h3 id="livePlatformTitle" class="text-base sm:text-lg font-bold text-blue-400">Phòng Họp / Hội Thảo Trực Tuyến</h3>
+            <p id="livePlatformUrl" class="text-xs text-slate-400 font-mono max-w-md truncate"></p>
+            <p class="text-xs text-slate-300 max-w-lg leading-relaxed">
+              Để dịch trực tiếp buổi phát sóng này: Bạn hãy mở phòng họp, sau đó bấm <b>"🎙️ Bật AI Nghe & Dịch Cabin"</b> (hoặc <b>"🖥️ Chiếu Màn Hình Phòng Họp"</b> nếu dùng máy tính).
+            </p>
+            <div class="flex flex-wrap justify-center gap-2 pt-1">
+              <a id="btnOpenExternalMeeting" href="#" target="_blank" rel="noopener" class="bg-blue-600 hover:bg-blue-500 text-white text-xs px-4 py-2.5 rounded-xl font-bold flex items-center gap-1.5 shadow-lg">
+                🔗 1. Mở Phòng Họp (Tab Mới / App)
+              </a>
+              <button onclick="startScreenCaptureStream()" class="bg-teal-600 hover:bg-teal-500 text-white text-xs px-4 py-2.5 rounded-xl font-bold flex items-center gap-1.5 shadow-lg">
+                🖥️ 2. Chiếu Màn Hình Phòng Họp Vào Đây
+              </button>
+              <button onclick="if(!isLiveListening) toggleLiveMicTranscribe();" class="bg-amber-600 hover:bg-amber-500 text-white text-xs px-4 py-2.5 rounded-xl font-bold flex items-center gap-1.5 shadow-lg">
+                🎙️ 3. Bật AI Nghe & Dịch Trực Tiếp
+              </button>
+            </div>
           </div>
         </div>
 
@@ -806,12 +1039,12 @@ HTML_CONTENT = r"""<!DOCTYPE html>
               </span>
               <button onclick="forceCutCurrentStream()" class="bg-amber-600 hover:bg-amber-500 text-white px-2 py-0.5 rounded text-[10px] font-bold">⚡ Chốt câu ngay</button>
             </div>
-            <p id="liveInterimText" class="text-xs text-white font-medium min-h-[18px]">Đang lắng nghe âm thanh từ video...</p>
+            <p id="liveInterimText" class="text-xs text-white font-medium min-h-[18px]">Đang lắng nghe âm thanh...</p>
             <p id="liveInterimVi" class="text-xs text-emerald-400 font-semibold min-h-[18px]"></p>
           </div>
 
           <div id="subtitleList" class="flex-1 overflow-y-auto space-y-2 pr-1 relative">
-            <p class="text-slate-400 text-xs sm:text-sm text-center pt-16">Hãy dán link YouTube và bấm "🚀 Phân Tích & Dịch Phụ Đề" hoặc bật "🎙️ AI Nghe Loa".</p>
+            <p class="text-slate-400 text-xs sm:text-sm text-center pt-16">Hãy dán link vào ô bên trái và bấm "🚀 Mở Link & Dịch Phụ Đề" hoặc bật "🎙️ AI Nghe Loa".</p>
           </div>
         </div>
 
@@ -887,7 +1120,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       </div>
       <p class="text-xs text-slate-300 leading-relaxed">
         • Mọi câu thu được từ <b>🎙️ AI Nghe Loa</b> đều tự động ghi vào đây theo thời gian thực.<br>
-        • Bạn cũng có thể dán trực tiếp bản chép lời (Show transcript) từ YouTube vào đây để dịch ngay:
+        • Bạn cũng có thể dán trực tiếp bản chép lời (Show transcript) vào đây để dịch ngay:
       </p>
       <textarea id="pasteRawArea" rows="8" placeholder="Dán nội dung transcript vào đây..." class="w-full p-3 rounded-xl bg-slate-950 border border-slate-700 text-xs text-white font-mono focus:outline-none focus:border-purple-500"></textarea>
       <div class="flex justify-end gap-2">
@@ -910,11 +1143,11 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
   <script src="https://www.youtube.com/iframe_api"></script>
   <script>
-    let player = null, subtitles = [], currentVideoId = "", currentTitle = "";
+    let player = null, subtitles = [], currentVideoId = "", currentTitle = "", currentSourceType = "youtube";
     let activeTimer = null, activeSubIndex = 0, jobId = 0, currentTab = "scene";
     let cabinEnabled = false, isSpeaking = false, lastSpokenIdx = -1, duckVol = 20, cabinRate = 1.2;
 
-    let speechRec = null, isLiveListening = false;
+    let speechRec = null, isLiveListening = false, liveStartTimestamp = 0;
     let streamResultIndex = -1, streamConsumedWords = 0, streamChunkStartSec = 0;
     let liveUnreadWords = [], interimTransTimer = null;
     let extractedVocabList = [];
@@ -922,7 +1155,6 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     const cabinAudio = new Audio(), dictAudio = new Audio();
     cabinAudio.playsInline = true; dictAudio.playsInline = true;
 
-    // Bộ lọc loại bỏ các từ tiếng Anh thông dụng để Sổ Từ Vựng chỉ lấy thuật ngữ chuyên môn
     const STOP_WORDS = new Set([
       "the","and","that","this","with","from","have","will","your","they","what","when","where","which","there","their",
       "about","would","could","should","because","these","those","into","more","some","very","just","also","than","then",
@@ -941,13 +1173,18 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       return `${m}:${r < 10 ? '0' : ''}${r}`;
     }
 
-    function extractVid(url) {
-      if (!url) return null;
-      const u = url.trim();
-      const m = u.match(/(?:v=|youtu\.be\/|embed\/|shorts\/|live\/|\/v\/)([0-9A-Za-z_-]{11})/);
-      if (m) return m[1];
-      const m2 = u.match(/(?:^|[^0-9A-Za-z_-])([0-9A-Za-z_-]{11})(?:$|[^0-9A-Za-z_-])/);
-      return m2 ? m2[1] : null;
+    function getCurrentPlaybackSecond() {
+      if (currentSourceType === "youtube" && player && player.getCurrentTime) {
+        return Math.max(0, player.getCurrentTime() || 0);
+      }
+      const vEl = document.getElementById("html5Player");
+      if (currentSourceType === "direct_media" && vEl && !vEl.classList.contains("hidden")) {
+        return Math.max(0, vEl.currentTime || 0);
+      }
+      if (liveStartTimestamp > 0) {
+        return Math.max(0, (Date.now() - liveStartTimestamp) / 1000);
+      }
+      return 0;
     }
 
     async function fastTranslateClient(text, tl = "vi") {
@@ -1132,91 +1369,121 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       return normalizeSubsJS(res);
     }
 
-    async function fetchFromPhoneBrowser(vid) {
+    // LẤY PHỤ ĐỀ TRỰC TIẾP TỪ TRÌNH DUYỆT ĐIỆN THOẠI 4G / PC (KHÔNG CẦN BẮC CẦU 127.0.0.1)
+    async function fetchFromPhoneBrowser(vid, pbAsr, pbMan, pbAsrRaw) {
       const tasks = [
-        // 1. Nếu đang mở trên máy tính có chạy sẵn 127.0.0.1:8000 thì mượn luôn kết nối mạng nhà của 127.0.0.1
+        // Luồng 1: Gọi /youtubei/v1/get_transcript với Protobuf 8 trường đầy đủ
         (async () => {
-          if (location.hostname === "127.0.0.1" || location.hostname === "localhost") throw new Error("already_local");
-          const rLocal = await fetch("http://127.0.0.1:8000/api/process-video", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({url: "https://www.youtube.com/watch?v=" + vid})
-          });
-          if (!rLocal.ok) throw new Error("no_local");
-          const dLocal = await rLocal.json();
-          if (dLocal.subtitles && dLocal.subtitles.length) return dLocal.subtitles;
-          throw new Error("empty_local");
+          const gtUrl = "https://api.cors.lol/?url=" + encodeURIComponent("https://www.youtube.com/youtubei/v1/get_transcript?prettyPrint=false");
+          for (const pVal of [pbAsr, pbMan, pbAsrRaw].filter(Boolean)) {
+            try {
+              const r = await fetch(gtUrl, {
+                method: "POST",
+                headers: {"Content-Type": "text/plain;charset=UTF-8"},
+                body: JSON.stringify({
+                  context: {client: {clientName: "WEB", clientVersion: "2.20260115.01.00", hl: "en", gl: "US"}},
+                  params: pVal
+                })
+              });
+              if (r.ok) {
+                const subs = parseCapData(await r.text());
+                if (subs.length) return subs;
+              }
+            } catch(e) {}
+          }
+          throw new Error("gt_empty");
         })(),
-        // 2. Gọi Tactiq bọc qua CORS Proxy để không bị trình duyệt chặn CORS trên onrender.com
+        // Luồng 2: Đi qua Google Translate Proxy đồng bộ cả Watch + Timedtext trên trình duyệt
         (async () => {
-          const rT = await fetch("https://api.cors.lol/?url=" + encodeURIComponent("https://tactiq-apps-prod.tactiq.io/transcript"), {
-            method: "POST",
-            headers: {"Content-Type": "text/plain;charset=UTF-8"},
-            body: JSON.stringify({videoUrl: "https://www.youtube.com/watch?v=" + vid, langCode: "en"})
-          });
-          if (!rT.ok) throw new Error("tactiq_proxy");
-          const dT = await rT.json();
-          const subs = normalizeSubsJS((dT.captions || []).map(c => ({
-            text: (c.text || "").replace(/\n/g, " ").trim(),
-            start: +(parseFloat(c.start || 0)).toFixed(2),
-            duration: +(parseFloat(c.dur || 2.5)).toFixed(2)
-          })));
-          if (!subs.length) throw new Error("empty");
-          return subs;
-        })(),
-        // 3. Gọi NoteGPT qua codetabs / allorigins
-        (async () => {
-          const noteUrl = "https://notegpt.io/api/v2/video-transcript?platform=youtube&video_id=" + vid;
+          const gtWatch = `https://www-youtube-com.translate.goog/watch?v=${vid}&hl=en&_x_tr_sl=es&_x_tr_tl=en&_x_tr_hl=en`;
           for (const px of [
             u => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u),
             u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u)
           ]) {
             try {
-              const r = await fetch(px(noteUrl));
-              if (r.ok) {
-                const d = await r.json();
-                const trs = ((d.data || {}).transcripts) || {};
-                for (const k of Object.keys(trs)) {
-                  const items = trs[k].custom || trs[k].default || trs[k].auto || [];
-                  if (items.length) {
-                    const subs = normalizeSubsJS(items.map(it => {
-                      const st = toSecJS(it.start || 0);
-                      const et = toSecJS(it.end || (st + 2.5));
-                      return {text: it.text || "", start: st, duration: Math.max(et - st, 1.5)};
-                    }));
-                    if (subs.length) return subs;
-                  }
-                }
+              const r1 = await fetch(px(gtWatch));
+              const html = await r1.text();
+              const m = html.match(/"baseUrl"\s*:\s*"(https:\/\/www\.youtube\.com\/api\/timedtext[^"]+)"/);
+              if (m) {
+                let cleanU = m[1].replace(/\\u0026/g, "&").replace(/\\\//g, "/").replace("&fmt=srv3", "");
+                let gtSub = cleanU.replace("https://www.youtube.com/api/timedtext", "https://www-youtube-com.translate.goog/api/timedtext") + "&_x_tr_sl=es&_x_tr_tl=en&_x_tr_hl=en";
+                const r2 = await fetch(px(gtSub));
+                const subs = parseCapData(await r2.text());
+                if (subs.length) return subs;
               }
             } catch(e) {}
           }
-          throw new Error("notegpt_empty");
+          throw new Error("gt_watch_empty");
         })(),
-        // 4. Gọi Piped / Invidious từ trình duyệt
+        // Luồng 3: Quét trang Watch và tải Timedtext qua CÙNG MỘT PROXY (codetabs / allorigins) để giữ nguyên IP
         (async () => {
-          for (const host of ["https://pipedapi.kavin.rocks", "https://api.piped.private.coffee"]) {
+          const wUrl = `https://www.youtube.com/watch?v=${vid}&hl=en`;
+          for (const px of [
+            u => "https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(u),
+            u => "https://api.allorigins.win/raw?url=" + encodeURIComponent(u)
+          ]) {
             try {
-              const r = await fetch(`${host}/streams/${vid}`);
-              if (r.ok) {
-                const d = await r.json();
-                if (d.subtitles && d.subtitles.length) {
-                  const ch = d.subtitles.find(x => (x.code || "").startsWith("en")) || d.subtitles[0];
-                  if (ch && ch.url) {
-                    const r2 = await fetch(ch.url);
-                    const subs = parseCapData(await r2.text());
-                    if (subs.length) return subs;
-                  }
-                }
+              const r1 = await fetch(px(wUrl));
+              const html = await r1.text();
+              const m = html.match(/"baseUrl"\s*:\s*"(https:\/\/www\.youtube\.com\/api\/timedtext[^"]+)"/);
+              if (m) {
+                const cleanU = m[1].replace(/\\u0026/g, "&").replace(/\\\//g, "/").replace("&fmt=srv3", "");
+                const r2 = await fetch(px(cleanU));
+                const subs = parseCapData(await r2.text());
+                if (subs.length) return subs;
               }
             } catch(e) {}
           }
-          throw new Error("piped_empty");
+          throw new Error("watch_px_empty");
+        })(),
+        // Luồng 4: Gọi NoteGPT qua Proxy
+        (async () => {
+          const noteUrl = "https://notegpt.io/api/v2/video-transcript?platform=youtube&video_id=" + vid;
+          const r = await fetch("https://api.codetabs.com/v1/proxy?quest=" + encodeURIComponent(noteUrl));
+          if (!r.ok) throw new Error("notegpt");
+          const d = await r.json();
+          const trs = ((d.data || {}).transcripts) || {};
+          for (const k of Object.keys(trs)) {
+            const items = trs[k].custom || trs[k].default || trs[k].auto || [];
+            if (items.length) {
+              const subs = normalizeSubsJS(items.map(it => {
+                const st = toSecJS(it.start || 0);
+                const et = toSecJS(it.end || (st + 2.5));
+                return {text: it.text || "", start: st, duration: Math.max(et - st, 1.5)};
+              }));
+              if (subs.length) return subs;
+            }
+          }
+          throw new Error("empty");
         })()
       ];
       try {
         return await Promise.any(tasks);
       } catch(e) {
         return [];
+      }
+    }
+
+    // CHỨC NĂNG CHIẾU MÀN HÌNH & THU ÂM PHÒNG HỌP (ZOOM / MEET / TEAMS) TRÊN PC
+    async function startScreenCaptureStream() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+        return alert("Tính năng chiếu cửa sổ phòng họp hỗ trợ trên máy tính (Chrome/Edge). Trên điện thoại, bạn hãy bấm nút '1. Mở Phòng Họp' và bật '3. Bật AI Nghe & Dịch Trực Tiếp' nhé!");
+      }
+      try {
+        const stream = await navigator.mediaDevices.getDisplayMedia({video: true, audio: true});
+        const vEl = document.getElementById("html5Player");
+        vEl.srcObject = stream;
+        vEl.muted = false;
+        vEl.classList.remove("hidden");
+        document.getElementById("ytWrapper").classList.add("hidden");
+        document.getElementById("liveMeetingOverlay").classList.add("hidden");
+        vEl.play();
+        liveStartTimestamp = Date.now();
+        if (!isLiveListening) {
+          toggleLiveMicTranscribe();
+        }
+      } catch (e) {
+        alert("Chưa chọn cửa sổ chia sẻ: " + e.message);
       }
     }
 
@@ -1319,7 +1586,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
         streamConsumedWords += liveUnreadWords.length;
         liveUnreadWords = [];
         const st = streamChunkStartSec;
-        if (player && player.getCurrentTime) streamChunkStartSec = Math.max(0, player.getCurrentTime() - 0.5);
+        streamChunkStartSec = Math.max(0, getCurrentPlaybackSecond() - 0.5);
         document.getElementById("liveInterimText").innerText = "Đang nghe tiếp...";
         document.getElementById("liveInterimVi").innerText = "";
         commitSpokenSegment(chunk, st);
@@ -1331,7 +1598,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       const btn = document.getElementById("btnLiveMic");
       const statusBox = document.getElementById("liveSpeechStatusBox");
       if (!SR) {
-        return alert("Trình duyệt này chưa hỗ trợ Web Speech API (Hãy mở bằng Chrome hoặc Edge).");
+        return alert("Trình duyệt này chưa hỗ trợ Web Speech API (Hãy mở bằng Safari trên iOS hoặc Chrome/Edge).");
       }
       if (isLiveListening && speechRec) {
         forceCutCurrentStream();
@@ -1345,6 +1612,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
       if (subtitles.length === 0) {
         document.getElementById("subtitleList").innerHTML = "";
+      }
+      if (!liveStartTimestamp) {
+        liveStartTimestamp = Date.now();
       }
 
       speechRec = new SR();
@@ -1360,14 +1630,16 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       btn.innerText = "🔴 Đang Nghe (Dừng)";
       btn.className = "bg-amber-600 text-white py-2.5 px-2 rounded-lg font-bold text-[11px] flex items-center justify-center gap-1 animate-pulse";
 
-      if (player && player.playVideo) player.playVideo();
+      if (currentSourceType === "youtube" && player && player.playVideo) {
+        player.playVideo();
+      }
 
       speechRec.onresult = (event) => {
         const idx = event.resultIndex;
         if (idx !== streamResultIndex) {
           streamResultIndex = idx;
           streamConsumedWords = 0;
-          streamChunkStartSec = (player && player.getCurrentTime) ? Math.max(0, player.getCurrentTime() - 1) : 0;
+          streamChunkStartSec = Math.max(0, getCurrentPlaybackSecond() - 1);
         }
 
         const fullTranscript = (event.results[idx][0].transcript || "").trim();
@@ -1380,9 +1652,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
           liveUnreadWords = liveUnreadWords.slice(10);
           streamConsumedWords += 10;
           const st = streamChunkStartSec;
-          if (player && player.getCurrentTime) {
-            streamChunkStartSec = Math.max(0, player.getCurrentTime() - 1);
-          }
+          streamChunkStartSec = Math.max(0, getCurrentPlaybackSecond() - 1);
           commitSpokenSegment(takeWords.join(" "), st);
         }
 
@@ -1405,7 +1675,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
               const viPre = await fastTranslateClient(liveUnreadWords.join(" "), tl);
               document.getElementById("liveInterimVi").innerText = "➔ " + viPre;
             }
-          }, 350);
+          }, 300);
         }
       };
 
@@ -1433,52 +1703,105 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       startBgTrans();
     }
 
+    function showPlayerMode(mode, info = {}) {
+      currentSourceType = mode;
+      const ytWrap = document.getElementById("ytWrapper");
+      const h5 = document.getElementById("html5Player");
+      const liveOv = document.getElementById("liveMeetingOverlay");
+
+      ytWrap.classList.add("hidden");
+      h5.classList.add("hidden");
+      liveOv.classList.add("hidden");
+
+      if (mode === "youtube") {
+        ytWrap.classList.remove("hidden");
+        initPlayer(info.video_id);
+      } else if (mode === "direct_media") {
+        h5.srcObject = null;
+        h5.src = info.media_url;
+        h5.classList.remove("hidden");
+      } else {
+        liveOv.classList.remove("hidden");
+        document.getElementById("livePlatformTitle").innerText = info.platform || info.title || "Phòng Họp / Livestream Trực Tuyến";
+        document.getElementById("livePlatformUrl").innerText = info.media_url || "";
+        document.getElementById("btnOpenExternalMeeting").href = info.media_url || "#";
+        liveStartTimestamp = Date.now();
+      }
+    }
+
     function applyLoadedLecture(d) {
       currentVideoId = d.video_id;
-      currentTitle = d.title || ("Video (" + d.video_id + ")");
+      currentTitle = d.title || ("Bài giảng (" + d.video_id + ")");
       document.getElementById("lectureTitleDisplay").innerText = currentTitle;
-      document.getElementById("lectureUrlDisplay").innerText = "https://www.youtube.com/watch?v=" + currentVideoId;
-      subtitles = d.subtitles;
+      document.getElementById("lectureUrlDisplay").innerText = d.media_url || ("https://www.youtube.com/watch?v=" + currentVideoId);
+      subtitles = d.subtitles || [];
       lastSpokenIdx = -1;
       document.getElementById("pasteRawArea").value = subtitles.map(s => `${formatTime(s.start)} ${s.text}`).join("\n");
       renderSubs();
       startBgTrans();
     }
 
-    async function processUrlOrId(url) {
-      const vid = extractVid(url);
-      if (!vid) return alert("Bạn hãy dán đường dẫn YouTube hợp lệ vào ô YouTube URL nhé!");
+    // XỬ LÝ MỌI ĐƯỜNG DẪN (YOUTUBE, LINK RÚT GỌN Z-WAKA, ZOOM, GOOGLE MEET, MS TEAMS...)
+    async function processUrlOrId(rawUrl) {
+      const cleanUrl = (rawUrl || "").trim();
+      if (!cleanUrl) return alert("Bạn hãy dán đường dẫn Video hoặc link Zoom / Meet / Teams / Z-Waka vào ô URL nhé!");
 
       clearAllSubtitles();
-      currentVideoId = vid;
       const customT = document.getElementById("customTitle").value.trim();
       const targetLang = document.getElementById("targetLang").value;
 
-      initPlayer(vid);
-      document.getElementById("lectureTitleDisplay").innerText = "Đang tải video (" + vid + ")...";
-      document.getElementById("lectureUrlDisplay").innerText = "https://www.youtube.com/watch?v=" + vid;
+      document.getElementById("lectureTitleDisplay").innerText = "Đang phân tích đường dẫn...";
+      document.getElementById("lectureUrlDisplay").innerText = cleanUrl;
       const box = document.getElementById("subtitleList");
-      box.innerHTML = `<p class="text-blue-400 text-xs sm:text-sm text-center pt-16 animate-pulse">⏳ Đang trích xuất phụ đề thực tế của video...</p>`;
+      box.innerHTML = `<p class="text-blue-400 text-xs sm:text-sm text-center pt-16 animate-pulse">⏳ Đang giải mã đường dẫn & trích xuất phụ đề...</p>`;
       document.getElementById("subCount").innerText = "Đang tải...";
 
-      const serverPromise = fetch("/api/process-video", {
+      const r = await fetch("/api/process-video", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({url: "https://www.youtube.com/watch?v=" + vid, custom_title: customT, target_lang: targetLang})
-      }).then(r => r.json()).catch(() => ({need_client_fetch: true}));
+        body: JSON.stringify({url: cleanUrl, custom_title: customT, target_lang: targetLang})
+      });
+      const d = await r.json();
 
-      const d = await serverPromise;
+      if (d.error) {
+        box.innerHTML = `<p class="text-amber-400 text-xs text-center pt-12 px-4">${d.error}</p>`;
+        return;
+      }
+
       if (d.title) {
         currentTitle = d.title;
         document.getElementById("lectureTitleDisplay").innerText = currentTitle;
       }
+      if (d.video_id) currentVideoId = d.video_id;
 
+      showPlayerMode(d.source_type || "youtube", d);
+
+      // Nếu là phòng họp trực tiếp (Zoom / Meet / Teams / Z-Waka)
+      if (d.source_type === "external_live" || d.source_type === "direct_media") {
+        if (d.subtitles && d.subtitles.length) {
+          applyLoadedLecture(d);
+        } else {
+          box.innerHTML = `<div class="text-center pt-8 px-4 space-y-3">
+            <p class="text-emerald-400 font-semibold text-xs sm:text-sm">📡 Đã kết nối chế độ Phòng Họp / Livestream: ${d.title}</p>
+            <p class="text-slate-300 text-xs leading-relaxed">Hãy bấm nút bên dưới để AI tự động nghe lời diễn giả và dịch song ngữ theo thời gian thực:</p>
+            <div class="flex justify-center gap-2 pt-2">
+              <button onclick="if(!isLiveListening) toggleLiveMicTranscribe();" class="bg-amber-600 hover:bg-amber-500 text-white text-xs px-4 py-2.5 rounded-xl font-bold shadow-lg">🎙️ Bật AI Nghe & Dịch Trực Tiếp</button>
+              <button onclick="openPasteModal()" class="bg-purple-600 hover:bg-purple-500 text-white text-xs px-3.5 py-2.5 rounded-xl font-bold">📋 Dán Transcript</button>
+            </div>
+          </div>`;
+          document.getElementById("subCount").innerText = "Chế độ Live";
+        }
+        return;
+      }
+
+      // Nếu là YouTube và Backend đã lấy được phụ đề
       if (d.subtitles && d.subtitles.length) {
         applyLoadedLecture(d);
         return;
       }
 
-      const rawSubs = await fetchFromPhoneBrowser(vid);
+      // Nếu IP đám mây Render bị chặn, trình duyệt Điện thoại 4G / PC tự lấy trực tiếp
+      const rawSubs = await fetchFromPhoneBrowser(d.video_id, d.pb_asr, d.pb_man, d.pb_asr_raw);
       if (rawSubs && rawSubs.length) {
         subtitles = rawSubs.map(s => ({...s, vi: s.vi || "⏳ Đang dịch...", translated: Boolean(s.translated)}));
         document.getElementById("pasteRawArea").value = subtitles.map(s => `${formatTime(s.start)} ${s.text}`).join("\n");
@@ -1488,9 +1811,9 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       }
 
       box.innerHTML = `<div class="text-center pt-8 px-4 space-y-3">
-        <p class="text-amber-400 text-xs sm:text-sm leading-relaxed">Video này hiện bị tường lửa YouTube chặn trên IP đám mây. Bạn hãy bấm nút bên dưới để AI nghe và dịch trực tiếp theo thời gian thực nhé!</p>
+        <p class="text-amber-400 text-xs sm:text-sm leading-relaxed">Video này hiện không mở phụ đề công khai. Bạn hãy bấm nút bên dưới để AI nghe và dịch trực tiếp theo thời gian thực nhé!</p>
         <div class="flex justify-center gap-2 pt-2">
-          <button onclick="toggleLiveMicTranscribe()" class="bg-amber-600 hover:bg-amber-500 text-white text-xs px-4 py-2 rounded-lg font-bold shadow-lg">🎙️ Bật AI Nghe Loa (Dịch Tức Thì)</button>
+          <button onclick="if(!isLiveListening) toggleLiveMicTranscribe();" class="bg-amber-600 hover:bg-amber-500 text-white text-xs px-4 py-2 rounded-lg font-bold shadow-lg">🎙️ Bật AI Nghe Loa (Dịch Tức Thì)</button>
           <button onclick="openPasteModal()" class="bg-purple-600 hover:bg-purple-500 text-white text-xs px-3.5 py-2 rounded-lg font-bold">📋 Dán Transcript</button>
         </div>
       </div>`;
@@ -1660,6 +1983,8 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       const filtered = saved.filter(x => x.video_id !== currentVideoId);
       filtered.unshift({
         video_id: currentVideoId,
+        source_type: currentSourceType,
+        media_url: document.getElementById("lectureUrlDisplay").innerText,
         title: currentTitle,
         date: new Date().toLocaleString("vi-VN"),
         count: subtitles.length,
@@ -1707,7 +2032,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
       if (!item) return;
       closeSavedModal();
       clearAllSubtitles();
-      initPlayer(item.video_id);
+      showPlayerMode(item.source_type || "youtube", item);
       applyLoadedLecture(item);
     }
 
@@ -1720,14 +2045,14 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     }
 
     function exportVocabTxt() {
-      const lines = [`SỔ TỪ VỰNG BÀI GIẢNG: ${currentTitle}\nURL: https://www.youtube.com/watch?v=${currentVideoId}\n====================================\n`];
+      const lines = [`SỔ TỪ VỰNG BÀI GIẢNG: ${currentTitle}\n====================================\n`];
       extractedVocabList.forEach(item => {
         lines.push(`- ${item.word.toUpperCase()}: ${item.meaning} (${formatTime(item.firstStart)})`);
       });
       const blob = new Blob([lines.join("\n")], {type: "text/plain;charset=utf-8"});
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = `Tu_Vung_${currentVideoId}.txt`;
+      a.download = `Tu_Vung_${currentVideoId || 'video'}.txt`;
       a.click();
     }
 
@@ -1755,7 +2080,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
               if (e.data === 2 || e.data === 0) stopCabin();
               if (e.data === 1 && player.getVideoData) {
                 const playingId = player.getVideoData().video_id;
-                if (playingId && playingId !== currentVideoId) {
+                if (playingId && playingId !== currentVideoId && currentSourceType === "youtube") {
                   document.getElementById("videoUrl").value = "https://www.youtube.com/watch?v=" + playingId;
                   processUrlOrId("https://www.youtube.com/watch?v=" + playingId);
                 }
@@ -1810,7 +2135,7 @@ HTML_CONTENT = r"""<!DOCTYPE html>
     }
 
     function triggerCabin() {
-      if (!cabinEnabled || isSpeaking || !player || !player.getPlayerState || player.getPlayerState() !== 1) return;
+      if (!cabinEnabled || isSpeaking || currentSourceType !== "youtube" || !player || !player.getPlayerState || player.getPlayerState() !== 1) return;
       if (activeSubIndex > lastSpokenIdx && subtitles[activeSubIndex]) {
         let idx = activeSubIndex, txt = subtitles[idx].vi || "";
         if (txt.length < 45 && idx + 1 < subtitles.length && subtitles[idx + 1].translated) {
@@ -1823,10 +2148,10 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     async function analyzeVideo() {
       const url = document.getElementById("videoUrl").value.trim();
-      if (!url) return alert("Bạn hãy dán link YouTube vào ô YouTube URL nhé!");
+      if (!url) return alert("Bạn hãy dán đường dẫn (YouTube, Zoom, Meet, Teams, Z-Waka...) vào ô URL nhé!");
       const btn = document.getElementById("btnLoad");
       const oldTxt = btn.innerText;
-      btn.innerText = "⏳ Đang trích xuất..."; btn.disabled = true; stopCabin();
+      btn.innerText = "⏳ Đang kết nối..."; btn.disabled = true; stopCabin();
       try { await processUrlOrId(url); }
       catch (e) { alert("Lỗi kết nối: " + e.message); }
       finally { btn.innerText = oldTxt; btn.disabled = false; }
@@ -1876,28 +2201,35 @@ HTML_CONTENT = r"""<!DOCTYPE html>
 
     function playSeg(start, dur, i) {
       activeSubIndex = i; stopCabin();
-      if (player && player.seekTo) {
+      if (currentSourceType === "youtube" && player && player.seekTo) {
         player.setVolume(100); player.seekTo(start, true); player.playVideo();
         if (activeTimer) clearTimeout(activeTimer);
         activeTimer = setTimeout(() => player.pauseVideo(), (dur + 0.25) * 1000);
+      } else if (currentSourceType === "direct_media") {
+        const vEl = document.getElementById("html5Player");
+        vEl.currentTime = start;
+        vEl.play();
       }
     }
 
     function playCabinOne(i) {
       const s = subtitles[i]; if (!s) return;
       activeSubIndex = i; if (activeTimer) clearTimeout(activeTimer);
-      if (player && player.seekTo) { player.setVolume(duckVol); player.seekTo(s.start, true); player.playVideo(); }
+      if (currentSourceType === "youtube" && player && player.seekTo) {
+        player.setVolume(duckVol); player.seekTo(s.start, true); player.playVideo();
+      }
       document.getElementById("cabinLiveBar").classList.remove("hidden");
-      speakText(s.vi, () => { if (!cabinEnabled && player) player.setVolume(100); });
-      activeTimer = setTimeout(() => { if (!cabinEnabled && player) { player.pauseVideo(); player.setVolume(100); } }, Math.max(s.duration + 0.8, 3.5) * 1000);
+      speakText(s.vi, () => { if (!cabinEnabled && player && player.setVolume) player.setVolume(100); });
+      activeTimer = setTimeout(() => { if (!cabinEnabled && currentSourceType === "youtube" && player) { player.pauseVideo(); player.setVolume(100); } }, Math.max(s.duration + 0.8, 3.5) * 1000);
     }
 
     function playCurrentSentence() { const s = subtitles[activeSubIndex]; if (s) playSeg(s.start, s.duration, activeSubIndex); }
 
     let lastHl = -1;
     setInterval(() => {
-      if (!player || !player.getCurrentTime || isLiveListening) return;
-      const t = player.getCurrentTime();
+      if (isLiveListening) return;
+      const t = getCurrentPlaybackSecond();
+      if (!t && currentSourceType !== "youtube") return;
       const idx = subtitles.findIndex(s => t >= s.start && t <= s.start + s.duration);
       if (idx !== -1 && idx !== lastHl) {
         if (lastHl !== -1 && document.getElementById("sub-" + lastHl)) document.getElementById("sub-" + lastHl).classList.remove("active-sub");
